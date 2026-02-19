@@ -1076,7 +1076,7 @@ def main():
     """Main entry point"""
     # Static configuration
     # STATIC_API_URL = 'ws://0.0.0.0:8000/listen_trading_client'
-    STATIC_API_URL = 'wss://stock-api-qg5u.onrender.com/listen_trading_client'
+    STATIC_API_URL = 'wss://stock-api-1-jhsa.onrender.com/listen_trading_client'
 
     
     parser = argparse.ArgumentParser(description='Local Trading Client for Cloud API')
