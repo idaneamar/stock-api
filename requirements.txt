@@ -1,0 +1,21 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+websockets>=11.0.2
+pydantic>=2.8.0
+python-dotenv==1.0.0
+pydantic-settings>=2.4.0
+sqlalchemy>=2.0.35
+alembic>=1.13.0
+psycopg2-binary>=2.9.10
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+pandas>=2.2.0
+pytz==2023.3
+requests
+# Trading analysis dependencies
+ta>=0.10.2
+numpy>=1.24.0
+openpyxl>=3.1.0
+backoff>=2.2.1
+tqdm>=4.65.0
