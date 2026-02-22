@@ -318,6 +318,12 @@ def create_tables():
                         }
                         baseline.config = updated_config
                         db.commit()
+                        # Also sync active_config so scans without an explicit program_id
+                        # immediately pick up the corrected rules.
+                        active = Settings.get_settings(db)
+                        if getattr(active, "active_program_id", None) == "str_code_9":
+                            Settings.set_active_program(db, "str_code_9", updated_config)
+                            db.commit()
                         logging.info("Migrated STR_CODE_9 baseline: adx_min=None, volume_spike_required=False, min_risk_reward=2.0.")
 
                 # If nothing is active yet, set baseline as active.
