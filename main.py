@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings as config_settings
 from app.schemas.response import ErrorResponse
 from app.models.init_db import create_tables
-from app.routers import scans, analysis, websocket, settings, trades, strategies, programs
+from app.routers import scans, analysis, websocket, settings, trades, strategies, programs, ai
 
 # -----------------------------
 # Logging (configure early)
@@ -112,6 +112,7 @@ app.include_router(settings.router)
 app.include_router(strategies.router)
 app.include_router(programs.router)
 app.include_router(trades.router)
+app.include_router(ai.router)
 
 # -----------------------------
 # Exception handlers
