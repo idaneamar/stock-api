@@ -25,7 +25,7 @@ from app.models.program import Program
 import ast
 import operator as op_operator
 
-API_KEY = "699ae161e60555.92486250"
+API_KEY = os.environ.get("EODHD_API_TOKEN", "699ae161e60555.92486250")
 
 holidays_cache = {}
 

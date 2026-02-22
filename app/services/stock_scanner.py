@@ -15,8 +15,9 @@ from app.models.database import SessionLocal
 from app.models.scan import ScanRecord
 from app.models.settings import Settings
 
-# API Configuration
-API_KEY = "699ae161e60555.92486250"
+# API Configuration – reads from environment variable first, falls back to hardcoded value
+import os as _os
+API_KEY = _os.environ.get("EODHD_API_TOKEN", "699ae161e60555.92486250")
 BASE_URL = "https://eodhd.com/api"
 
 class StockScanner:
