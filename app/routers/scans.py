@@ -30,14 +30,16 @@ async def scan_stocks(criteria: StockScannerRequest):
     volume, volatility, and other criteria. Returns immediately with scan ID.
     """
     try:
-        logging.info("="*60)
-        logging.info(f"🚀 NEW SCAN REQUEST RECEIVED")
-        logging.info(f"📋 Scan criteria: {criteria.dict()}")
-        logging.info("="*60)
-        
-        # Convert Pydantic model to dict for the scanner service
         scan_criteria = criteria.dict()
-        
+        received_program_id = scan_criteria.get("program_id") if scan_criteria else None
+        if received_program_id is not None and str(received_program_id).strip() == "":
+            received_program_id = None
+        logging.info("="*60)
+        logging.info("🚀 NEW SCAN REQUEST RECEIVED")
+        logging.info("📋 Scan criteria: %s", scan_criteria)
+        logging.info("📌 POST /scans received program_id: %s", received_program_id if received_program_id else "(absent/empty - backend will use only globally enabled strategies)")
+        logging.info("="*60)
+
         # Start background scan and get scan ID
         scan_id = stock_scanner.start_background_scan(scan_criteria)
         

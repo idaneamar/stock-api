@@ -16,7 +16,7 @@ from app.models.scan import ScanRecord
 from app.models.settings import Settings
 
 # API Configuration
-API_KEY = "681a29e3b6f558.05762306"
+API_KEY = "699ae161e60555.92486250"
 BASE_URL = "https://eodhd.com/api"
 
 class StockScanner:

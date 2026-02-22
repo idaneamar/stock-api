@@ -149,25 +149,137 @@ def create_tables():
         _ensure_unified_analysis_schema(engine)
         _verify_expected_schema(engine)
 
-        # Seed default strategies (if table is empty)
+        # Strategy configs matching str code 9 exactly:
+        # - Pre-filters: volume_spike required + ADX > 30
+        # - Trend/Momentum: SL=2×ATR, TP=4×ATR
+        # - VWAP: SL=1.5×ATR, TP=3×ATR (≥2.0 R:R), dynamic threshold vs VWAP±0.5×ATR
+        # - All with MACD confirmation and min R:R = 2.0
+        _STR9_PRE_FILTERS = [
+            {"indicator": "volume_spike", "operator": "==", "value": 1},
+            {"indicator": "adx", "operator": ">", "value": 30},
+        ]
+
+        _STRATEGY_CONFIGS = {
+            "Trend": {
+                "pre_filters": _STR9_PRE_FILTERS,
+                "buy_rules": [
+                    {"indicator": "ema20", "operator": ">", "compare_to": "ema50"},
+                    {"indicator": "rsi", "operator": "<", "value": 50},
+                    {"indicator": "macd", "operator": ">", "compare_to": "macd_signal"},
+                ],
+                "sell_rules": [
+                    {"indicator": "ema20", "operator": "<", "compare_to": "ema50"},
+                    {"indicator": "rsi", "operator": ">", "value": 50},
+                    {"indicator": "macd", "operator": "<", "compare_to": "macd_signal"},
+                ],
+                "risk": {"stop_loss_atr_mult": 2.0, "take_profit_atr_mult": 4.0, "min_risk_reward": 2.0},
+            },
+            "Momentum": {
+                # Only Buy signals (no sell_rules), mirroring str code 9 momentum direction
+                "pre_filters": _STR9_PRE_FILTERS,
+                "buy_rules": [
+                    {"indicator": "macd", "operator": ">", "compare_to": "macd_signal"},
+                    {"indicator": "rsi", "operator": "<", "value": 50},
+                ],
+                "sell_rules": [],
+                "risk": {"stop_loss_atr_mult": 2.0, "take_profit_atr_mult": 4.0, "min_risk_reward": 2.0},
+            },
+            "VWAP": {
+                # close < vwap - 0.5*atr for buy; close > vwap + 0.5*atr for sell
+                "pre_filters": _STR9_PRE_FILTERS,
+                "buy_rules": [
+                    {"indicator": "close", "operator": "<", "expression": "vwap - 0.5 * atr"},
+                    {"indicator": "rsi", "operator": "<", "value": 50},
+                    {"indicator": "macd", "operator": ">", "compare_to": "macd_signal"},
+                ],
+                "sell_rules": [
+                    {"indicator": "close", "operator": ">", "expression": "vwap + 0.5 * atr"},
+                    {"indicator": "rsi", "operator": ">", "value": 50},
+                    {"indicator": "macd", "operator": "<", "compare_to": "macd_signal"},
+                ],
+                "risk": {"stop_loss_atr_mult": 1.5, "take_profit_atr_mult": 3.0, "min_risk_reward": 2.0},
+            },
+            "Breakout": {
+                "pre_filters": _STR9_PRE_FILTERS,
+                "buy_rules": [
+                    {"indicator": "close", "operator": ">", "compare_to": "bb_upper"},
+                ],
+                "sell_rules": [
+                    {"indicator": "close", "operator": "<", "compare_to": "bb_lower"},
+                ],
+                "risk": {"stop_loss_atr_mult": 2.0, "take_profit_atr_mult": 4.0, "min_risk_reward": 2.0},
+            },
+            "Mean Reversion": {
+                "pre_filters": [],
+                "buy_rules": [
+                    {"indicator": "rsi", "operator": "<", "value": 30},
+                    {"indicator": "close", "operator": "<", "compare_to": "bb_lower"},
+                ],
+                "sell_rules": [
+                    {"indicator": "rsi", "operator": ">", "value": 70},
+                    {"indicator": "close", "operator": ">", "compare_to": "bb_upper"},
+                ],
+                "risk": {"stop_loss_atr_mult": 1.0, "take_profit_atr_mult": 2.0, "min_risk_reward": 2.0},
+            },
+        }
+
+        _STRATEGY_ENABLED = {
+            "Trend": True, "Momentum": True, "VWAP": True,
+            "Breakout": False, "Mean Reversion": False,
+        }
+
+        # Seed default strategies (if table is empty) or fix configs on existing strategies
         try:
             db = SessionLocal()
             try:
-                existing = db.query(Strategy).count()
-                if existing == 0:
+                existing_strategies = db.query(Strategy).all()
+                if not existing_strategies:
                     defaults = [
-                        Strategy(name="Trend", enabled=True),
-                        Strategy(name="Momentum", enabled=True),
-                        Strategy(name="VWAP", enabled=True),
-                        Strategy(name="Breakout", enabled=False),
-                        Strategy(name="Mean Reversion", enabled=False),
+                        Strategy(
+                            name=name,
+                            enabled=_STRATEGY_ENABLED.get(name, False),
+                            config=cfg,
+                        )
+                        for name, cfg in _STRATEGY_CONFIGS.items()
                     ]
                     db.add_all(defaults)
                     db.commit()
+                    logging.info("Seeded default strategies with buy/sell rule configs.")
+                else:
+                    # Update any existing strategy that has an empty / missing config
+                    updated = 0
+                    for strat in existing_strategies:
+                        if not strat.config or not (
+                            strat.config.get("buy_rules") or strat.config.get("sell_rules")
+                        ):
+                            new_cfg = _STRATEGY_CONFIGS.get(strat.name)
+                            if new_cfg:
+                                strat.config = new_cfg
+                                updated += 1
+                    if updated:
+                        db.commit()
+                        logging.info(f"Migrated {updated} strategies with missing buy/sell rule configs.")
             finally:
                 db.close()
         except Exception as seed_strat_error:
             logging.warning(f"Could not seed default strategies: {seed_strat_error}")
+
+        # Baseline program config matching str code 9:
+        # volume_spike + adx>30 are enforced inside each strategy's pre_filters,
+        # so the global rules do NOT repeat them (avoids double-filtering).
+        _BASELINE_CONFIG = {
+            "enabled_strategy_names": ["Trend", "Momentum", "VWAP"],
+            "rules": {
+                "strict_rules": True,
+                "adx_min": None,
+                "volume_spike_required": False,
+            },
+            "market": {"use_vix_filter": True},
+            "risk": {
+                "daily_loss_limit_pct": 0.02,
+                "min_risk_reward": 2.0,
+            },
+        }
 
         # Seed baseline program (STR CODE 9)
         try:
@@ -179,19 +291,34 @@ def create_tables():
                         program_id="str_code_9",
                         name="Baseline – STR CODE 9",
                         is_baseline=True,
-                        config={
-                            "enabled_strategy_names": ["Trend", "Momentum", "VWAP"],
-                            "rules": {
-                                "strict_rules": True,
-                                "adx_min": 30,
-                                "volume_spike_required": True,
-                            },
-                            "market": {"use_vix_filter": True},
-                            "risk": {"daily_loss_limit_pct": 0.02},
-                        },
+                        config=_BASELINE_CONFIG,
                     )
                     db.add(baseline)
                     db.commit()
+                else:
+                    # Migrate existing baseline to match str code 9:
+                    # adx/volume_spike live in each strategy's pre_filters, not as global rules.
+                    existing_rules = (baseline.config or {}).get("rules", {})
+                    existing_risk = (baseline.config or {}).get("risk", {})
+                    needs_update = (
+                        existing_rules.get("adx_min") is not None
+                        or existing_rules.get("volume_spike_required") is True
+                        or existing_risk.get("min_risk_reward", 0) != 2.0
+                    )
+                    if needs_update:
+                        updated_config = dict(baseline.config or {})
+                        updated_config["rules"] = {
+                            "strict_rules": existing_rules.get("strict_rules", True),
+                            "adx_min": None,
+                            "volume_spike_required": False,
+                        }
+                        updated_config["risk"] = {
+                            "daily_loss_limit_pct": existing_risk.get("daily_loss_limit_pct", 0.02),
+                            "min_risk_reward": 2.0,
+                        }
+                        baseline.config = updated_config
+                        db.commit()
+                        logging.info("Migrated STR_CODE_9 baseline: adx_min=None, volume_spike_required=False, min_risk_reward=2.0.")
 
                 # If nothing is active yet, set baseline as active.
                 active = Settings.get_settings(db)

@@ -25,7 +25,7 @@ from app.models.program import Program
 import ast
 import operator as op_operator
 
-API_KEY = "681a29e3b6f558.05762306"
+API_KEY = "699ae161e60555.92486250"
 
 holidays_cache = {}
 
@@ -62,7 +62,7 @@ class TradingAnalysisService:
         self.min_risk_reward_ratio = 1.5
         self.active_trades = {}
         self.logger = logging.getLogger(__name__)
-        self._market_conditions_cache: Dict[str, tuple[bool, str]] = {}
+        self._market_conditions_cache: Dict[str, tuple[bool, str, str]] = {}
 
     def _update_analysis_progress(self, scan_id: int, progress: int):
         """Update analysis progress in database and send WebSocket event."""
@@ -326,27 +326,27 @@ class TradingAnalysisService:
         return None
 
     def check_market_conditions(self, end_date=None, ignore_vix: bool = False):
-        """Check market conditions using VIX (and derive a broad SPY trend note).
+        """Check market conditions using VIX and SPY trend (matching str code 9).
 
         Returns:
-            (ok, note) where ok gates analysis and note is for logging/UI.
+            (ok, note, market_trend) where ok gates analysis, note is for logging/UI,
+            and market_trend is 'bull', 'bear', or 'neutral' (used to filter signal direction).
         """
-        # Cache per date/toggle to avoid repeated VIX/SPY API calls per symbol (rate-limit safety).
         cache_date = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else (str(end_date) if end_date else "latest")
         cache_key = f"{cache_date}:ignore_vix={bool(ignore_vix)}"
         if cache_key in self._market_conditions_cache:
             return self._market_conditions_cache[cache_key]
 
         if ignore_vix:
-            out = (True, "VIX check disabled")
+            out = (True, "VIX check disabled", "neutral")
             self._market_conditions_cache[cache_key] = out
             return out
 
         vix_symbol = "VIX.INDX"
         vix_data = self.fetch_daily(vix_symbol, period="5d", end_date=end_date)
         if vix_data is None:
-            self.logger.warning("Failed to fetch VIX data. Assuming high volatility to be safe.")
-            out = (False, "Unable to fetch VIX data - assuming high volatility")
+            self.logger.warning("Failed to fetch VIX data. Proceeding with analysis (fail-open).")
+            out = (True, "VIX data unavailable – proceeding without VIX filter", "neutral")
             self._market_conditions_cache[cache_key] = out
             return out
 
@@ -354,17 +354,17 @@ class TradingAnalysisService:
             latest_vix = float(vix_data["close"].iloc[-1])
         except Exception as e:
             self.logger.error(f"Error accessing VIX data: {e}")
-            out = (False, "Error accessing VIX data - assuming high volatility")
+            out = (True, "Error reading VIX data – proceeding without VIX filter", "neutral")
             self._market_conditions_cache[cache_key] = out
             return out
 
         self.logger.info(f"VIX value: {latest_vix:.2f}")
         if latest_vix > 30:
-            out = (False, f"High market volatility (VIX = {latest_vix:.2f})")
+            out = (False, f"High market volatility (VIX = {latest_vix:.2f})", None)
             self._market_conditions_cache[cache_key] = out
             return out
 
-        # Optional: add a broad market trend note via SPY vs EMA200 (does not gate analysis).
+        # Derive broad SPY trend via EMA200 (mirrors str code 9 logic)
         market_trend = "neutral"
         try:
             spy_data = self.fetch_daily("SPY.US", period="250d", end_date=end_date)
@@ -377,10 +377,12 @@ class TradingAnalysisService:
                     market_trend = "bull"
                 elif latest_close < latest_ema200:
                     market_trend = "bear"
+            else:
+                self.logger.warning("Failed to fetch SPY data. Assuming neutral market.")
         except Exception as e:
             self.logger.warning(f"Failed to derive SPY trend: {e}")
 
-        out = (True, f"Normal market conditions (VIX = {latest_vix:.2f}, trend={market_trend})")
+        out = (True, f"Normal market conditions (VIX = {latest_vix:.2f}, trend={market_trend})", market_trend)
         self._market_conditions_cache[cache_key] = out
         return out
 
@@ -404,7 +406,7 @@ class TradingAnalysisService:
 
     def adjust_time_to_market_days(self, target_date, current_date):
         """Adjust time estimation to market days"""
-        market_days = min(max((target_date - current_date).days, 1), 15)
+        market_days = min(max((target_date - current_date).days, 1), 25)
         adjusted_date = current_date
         for _ in range(market_days):
             adjusted_date = self.get_next_market_day(adjusted_date + timedelta(days=1))
@@ -432,7 +434,7 @@ class TradingAnalysisService:
             days_needed = price_diff / abs(avg_change)
             variability = random.uniform(-std_change, std_change) / abs(avg_change) if std_change != 0 else 0
             days_needed = days_needed * (1 + variability * 0.5)
-            days_needed = min(max(int(days_needed), 1), 15)
+            days_needed = min(max(int(days_needed), 1), 20)
             return days_needed, None
         except Exception as e:
             self.logger.error(f"Error in estimate_time_to_target: {e}")
@@ -776,7 +778,7 @@ class TradingAnalysisService:
                 self.daily_loss = 0
                 self.last_reset_date = current_date
 
-            market_ok, market_note = self.check_market_conditions(end_date=analysis_date, ignore_vix=ignore_vix)
+            market_ok, market_note, market_trend = self.check_market_conditions(end_date=analysis_date, ignore_vix=ignore_vix)
             if not market_ok:
                 self.logger.info(f"Skipping {symbol}: {market_note}")
                 return []
@@ -792,6 +794,25 @@ class TradingAnalysisService:
                 valid_signals.extend(self._evaluate_strategy(strat, df, last))
 
             if not valid_signals:
+                return []
+
+            # Prefer non-VWAP signals when available (mirrors str code 9 preference)
+            non_vwap = [s for s in valid_signals if s.get("strategy_name") != "VWAP"]
+            if non_vwap:
+                valid_signals = non_vwap
+
+            # Filter by market trend: bull → Buy only; bear → Sell only (str code 9 logic)
+            if market_trend == "bull":
+                bullish = [s for s in valid_signals if s.get("signal") == "Buy"]
+                if bullish:
+                    valid_signals = bullish
+            elif market_trend == "bear":
+                bearish = [s for s in valid_signals if s.get("signal") == "Sell"]
+                if bearish:
+                    valid_signals = bearish
+
+            if not valid_signals:
+                self.logger.info(f"No signals aligned with market trend ({market_trend}) for {symbol}")
                 return []
 
             best_signal = max(valid_signals, key=lambda x: float(x.get("risk_reward_ratio", 0.0) or 0.0))
@@ -1127,19 +1148,41 @@ class TradingAnalysisService:
 
             criteria = scan_record.criteria or {}
 
-            # Resolve effective program/config for this scan.
-            # Priority: explicit criteria.program_id -> program config, else Settings.active_config.
-            active = Settings.get_active_program(db)
-            effective_program_id = criteria.get("program_id") or active.get("active_program_id")
-            effective_config = dict(active.get("active_config") or {})
+            # Rule: if program_id is provided => use ONLY that program's strategies (ignore global enabled).
+            #       if program_id is absent/empty => use ONLY globally enabled strategies.
+            received_program_id = criteria.get("program_id")
+            if received_program_id is not None and str(received_program_id).strip() == "":
+                received_program_id = None
 
-            if criteria.get("program_id"):
+            all_strategies = db.query(Strategy).all()
+            enabled_strategies = [s for s in all_strategies if bool(getattr(s, "enabled", False))]
+
+            if received_program_id:
+                # Use ONLY this program's strategies (ignore global enabled/disabled).
+                effective_program_id = str(received_program_id).strip()
+                effective_config = {}
                 try:
-                    p = db.query(Program).filter(Program.program_id == str(criteria.get("program_id"))).first()
+                    p = db.query(Program).filter(Program.program_id == effective_program_id).first()
                     if p and isinstance(p.config, dict):
                         effective_config = dict(p.config)
                 except Exception:
                     pass
+                program_enabled_names = set((effective_config.get("enabled_strategy_names") or []))
+                strategies_to_run = [s for s in all_strategies if s.name in program_enabled_names] if program_enabled_names else []
+                strategy_source = "program"
+            else:
+                # No program_id: use ONLY globally enabled strategies.
+                effective_program_id = None
+                effective_config = dict(Settings.get_active_program(db).get("active_config") or {})
+                strategies_to_run = list(enabled_strategies)
+                strategy_source = "globally_enabled"
+
+            strategy_ids_used = [int(s.id) for s in strategies_to_run]
+            strategy_names_used = [s.name for s in strategies_to_run]
+            self.logger.info(
+                "SCAN_STRATEGIES scan_id=%s received program_id=%s source=%s strategy_ids=%s strategy_names=%s",
+                scan_id, received_program_id, strategy_source, strategy_ids_used, strategy_names_used,
+            )
 
             # Apply per-scan overrides (single source: UI)
             rules_cfg = dict((effective_config.get("rules") or {}))
@@ -1157,35 +1200,6 @@ class TradingAnalysisService:
                     self.daily_loss_limit = float(dll)
             except Exception:
                 self.daily_loss_limit = 0.02
-
-            # Resolve strategies to run.
-            # If the program defines enabled_strategy_names, use those by name.
-            all_strategies = db.query(Strategy).all()
-            enabled_strategies = [s for s in all_strategies if bool(getattr(s, "enabled", False))]
-
-            program_enabled_names = set((effective_config.get("enabled_strategy_names") or []))
-            if program_enabled_names:
-                strategies_by_name = [s for s in all_strategies if s.name in program_enabled_names]
-            else:
-                strategies_by_name = []
-            selected = scan_record.selected_strategies
-            # Treat "no selection" (null/[]/empty) as "run all enabled strategies" so the user
-            # does not need to pick items explicitly.
-            if selected is None:
-                strategies_to_run = strategies_by_name or enabled_strategies
-            elif isinstance(selected, list):
-                if len(selected) == 0:
-                    strategies_to_run = strategies_by_name or enabled_strategies
-                else:
-                    # selected_strategies is stored as a JSON list of Strategy IDs.
-                    selected_ids = {int(sid) for sid in selected if isinstance(sid, (int, float)) or str(sid).isdigit()}
-                    if selected_ids:
-                        pool = strategies_by_name or enabled_strategies
-                        strategies_to_run = [s for s in pool if int(s.id) in selected_ids]
-                    else:
-                        strategies_to_run = strategies_by_name or enabled_strategies
-            else:
-                strategies_to_run = strategies_by_name or enabled_strategies
 
             if not scan_record.stock_symbols:
                 raise ValueError(f"No stock symbols found for scan {scan_id}")
