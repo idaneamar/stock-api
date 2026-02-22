@@ -96,6 +96,21 @@ def _ensure_unified_analysis_schema(engine) -> None:
                 except Exception:
                     pass
 
+            # Global engine toggles
+            _engine_cols = {
+                "strict_rules": "BOOLEAN NOT NULL DEFAULT TRUE",
+                "volume_spike_required": "BOOLEAN NOT NULL DEFAULT FALSE",
+                "use_intraday": "BOOLEAN NOT NULL DEFAULT FALSE",
+                "daily_loss_limit_pct": "DOUBLE PRECISION NOT NULL DEFAULT 0.02",
+                "adx_min": "DOUBLE PRECISION",
+            }
+            for col_name, col_def in _engine_cols.items():
+                if col_name not in settings_cols:
+                    try:
+                        conn.execute(text(f"ALTER TABLE settings ADD COLUMN IF NOT EXISTS {col_name} {col_def}"))
+                    except Exception:
+                        pass
+
     # Programs table (SQLite may not support IF NOT EXISTS in the same way across versions; create_all handles it.)
 
 def _verify_expected_schema(engine) -> None:

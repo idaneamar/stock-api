@@ -1184,18 +1184,33 @@ class TradingAnalysisService:
                 scan_id, received_program_id, strategy_source, strategy_ids_used, strategy_names_used,
             )
 
-            # Apply per-scan overrides (single source: UI)
+            # Resolve engine toggles: criteria > Settings DB > program config > hardcoded default
+            global_settings = Settings.get_settings(db)
+
             rules_cfg = dict((effective_config.get("rules") or {}))
             for k in ("strict_rules", "adx_min", "volume_spike_required"):
                 if k in criteria and criteria.get(k) is not None:
+                    # Explicit per-scan value wins
                     rules_cfg[k] = criteria.get(k)
+                elif not rules_cfg.get(k):
+                    # Fall back to global Settings row
+                    gs_val = getattr(global_settings, k, None)
+                    if gs_val is not None:
+                        rules_cfg[k] = gs_val
             effective_config["rules"] = rules_cfg
 
-            # Daily loss limit configurable
+            # allow_intraday_prices: criteria > Settings
+            if "allow_intraday_prices" not in criteria:
+                criteria = dict(criteria)
+                gs_intraday = getattr(global_settings, "use_intraday", False)
+                criteria["allow_intraday_prices"] = bool(gs_intraday)
+
+            # Daily loss limit: criteria > Settings > program config > default
             try:
                 dll = criteria.get("daily_loss_limit_pct")
                 if dll is None:
-                    dll = (effective_config.get("risk") or {}).get("daily_loss_limit_pct")
+                    dll_gs = getattr(global_settings, "daily_loss_limit_pct", None)
+                    dll = dll_gs if dll_gs is not None else (effective_config.get("risk") or {}).get("daily_loss_limit_pct")
                 if dll is not None:
                     self.daily_loss_limit = float(dll)
             except Exception:
@@ -1231,7 +1246,7 @@ class TradingAnalysisService:
             self.logger.info(f"Analyzing individual symbols with detailed strategies...")
             all_results = []
             ignore_vix = bool(criteria.get("ignore_vix", False))
-            allow_intraday_prices = bool(criteria.get("allow_intraday_prices", False))
+            allow_intraday_prices = bool(criteria.get("allow_intraday_prices", False))  # resolved above
             rules_for_scan = effective_config.get("rules") or {}
             for i, symbol in enumerate(symbols_to_analyze):
                 self.logger.info(f"Analyzing symbol {i+1}/{len(symbols_to_analyze)}: {symbol}")

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, String, JSON
+from sqlalchemy import Column, Integer, Float, String, JSON, Boolean
 from typing import Optional, Any, Dict
 from app.models.database import Base
 
@@ -12,13 +12,19 @@ class Settings(Base):
     active_program_id = Column(String(100), nullable=True)
     active_config = Column(JSON, nullable=False, default=dict)
 
+    # Global engine toggles – applied to every scan unless overridden per-scan
+    strict_rules = Column(Boolean, nullable=False, default=True)
+    adx_min = Column(Float, nullable=True)
+    volume_spike_required = Column(Boolean, nullable=False, default=False)
+    use_intraday = Column(Boolean, nullable=False, default=False)
+    daily_loss_limit_pct = Column(Float, nullable=False, default=0.02)
+
     @classmethod
     def _get_or_create(cls, db):
         """Fetch the singleton settings row, creating it with defaults if missing."""
         setting = db.query(cls).first()
         if not setting:
-            # Create default record if none exists
-            setting = cls()  # Will use default value from column definition
+            setting = cls()
             db.add(setting)
             db.commit()
             db.refresh(setting)
@@ -48,7 +54,12 @@ class Settings(Base):
         active_program_id: Optional[str] = None,
         active_config: Optional[Dict[str, Any]] = None,
     ):
-        """Persist provided settings values, creating defaults if necessary."""
+        """Persist provided settings values, creating defaults if necessary.
+
+        Engine-toggle fields (strict_rules, adx_min, etc.) are updated directly
+        via the settings router rather than through this method to allow explicit
+        None values (e.g. clearing adx_min).
+        """
         setting = cls._get_or_create(db)
 
         if portfolio_size is not None:
@@ -76,7 +87,6 @@ class Settings(Base):
             "active_program_id": s.active_program_id,
             "active_config": s.active_config or {},
         }
-
 
     @classmethod
     def set_daily_investment(cls, db, value: float):

@@ -142,6 +142,36 @@ async def apply_program(payload: ProgramApplyRequest, db: Session = Depends(get_
         raise HTTPException(status_code=500, detail="Error applying program")
 
 
+@router.delete("/{program_id}", response_model=StandardResponse)
+async def delete_program(program_id: str, db: Session = Depends(get_db)):
+    """Delete a user-created program. The built-in baseline program cannot be deleted."""
+    try:
+        program = (
+            db.query(Program)
+            .filter(Program.program_id == program_id, Program.is_baseline.is_(False))
+            .first()
+        )
+        if not program:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Program '{program_id}' not found or is the protected baseline program",
+            )
+        db.delete(program)
+        db.commit()
+        return StandardResponse(
+            success=True,
+            status=200,
+            message=f"Program '{program_id}' deleted successfully",
+            data={"program_id": program_id, "deleted": True},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logging.error(f"Error deleting program: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting program")
+
+
 @router.post("/revert-baseline", response_model=StandardResponse)
 async def revert_to_baseline(db: Session = Depends(get_db)):
     try:

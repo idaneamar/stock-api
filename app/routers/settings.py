@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from app.models.database import SessionLocal, get_db
@@ -17,85 +18,81 @@ router = APIRouter(
 stock_scanner = StockScanner()
 trade_service = TradeService()
 
+
+def _setting_to_dict(s: Settings) -> dict:
+    """Serialize a Settings row to a response-safe dict."""
+    return {
+        "portfolio_size": s.portfolio_size,
+        "strict_rules": bool(s.strict_rules) if s.strict_rules is not None else True,
+        "adx_min": s.adx_min,
+        "volume_spike_required": bool(s.volume_spike_required) if s.volume_spike_required is not None else False,
+        "use_intraday": bool(s.use_intraday) if s.use_intraday is not None else False,
+        "daily_loss_limit_pct": float(s.daily_loss_limit_pct) if s.daily_loss_limit_pct is not None else 0.02,
+    }
+
+
 class UpdateSettingsRequest(BaseModel):
     portfolio_size: float = Field(
         ...,
         ge=1000,
         description="Total portfolio size in USD (minimum 1,000)",
     )
+    strict_rules: Optional[bool] = Field(None, description="Enforce buy/sell rules as hard filters")
+    adx_min: Optional[float] = Field(None, description="Global minimum ADX (null = no minimum)")
+    volume_spike_required: Optional[bool] = Field(None, description="Require volume spike for any signal")
+    use_intraday: Optional[bool] = Field(None, description="Use intraday/real-time price when available")
+    daily_loss_limit_pct: Optional[float] = Field(None, description="Daily max loss limit as fraction (e.g. 0.02)")
 
-
-class SettingsResponse(BaseModel):
-    portfolio_size: float
 
 @router.get("/", response_model=StandardResponse)
 async def get_settings(db: Session = Depends(get_db)):
-    """
-    Get all current settings.
-    
-    Returns all settings configured in the system.
-    """
+    """Get all current settings including global engine toggles."""
     try:
-        # This will create a default record if none exists
         setting = Settings.get_settings(db)
-
-        settings_data = {
-            "portfolio_size": setting.portfolio_size,
-        }
-        
         return StandardResponse(
             success=True,
             status=200,
             message="Settings retrieved successfully",
-            data=settings_data
+            data=_setting_to_dict(setting),
         )
-        
     except Exception as e:
         logging.error(f"Error retrieving settings: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving settings: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error retrieving settings: {str(e)}")
+
 
 @router.put("/", response_model=StandardResponse)
-async def update_settings(
-    request: UpdateSettingsRequest, 
-    db: Session = Depends(get_db)
-):
-    """
-    Update all settings.
-    
-    Args:
-        portfolio_size: Total portfolio size in USD (minimum 1,000)
-    
-    Updates the settings used by the trading analysis system.
-    The minimum portfolio size is 1,000.
-    """
+async def update_settings(request: UpdateSettingsRequest, db: Session = Depends(get_db)):
+    """Update portfolio size and global engine toggles."""
     try:
-        updated_setting = Settings.update_settings(
-            db,
-            portfolio_size=request.portfolio_size,
-        )
+        setting = Settings.get_settings(db)
+        setting.portfolio_size = request.portfolio_size
 
-        settings_data = {
-            "portfolio_size": updated_setting.portfolio_size,
-        }
-        
+        # Engine toggles – only update fields the client explicitly sent
+        if request.strict_rules is not None:
+            setting.strict_rules = request.strict_rules
+        # adx_min is allowed to be None (clears the minimum)
+        setting.adx_min = request.adx_min
+        if request.volume_spike_required is not None:
+            setting.volume_spike_required = request.volume_spike_required
+        if request.use_intraday is not None:
+            setting.use_intraday = request.use_intraday
+        if request.daily_loss_limit_pct is not None:
+            setting.daily_loss_limit_pct = request.daily_loss_limit_pct
+
+        db.commit()
+        db.refresh(setting)
+
         return StandardResponse(
             success=True,
             status=200,
             message="Settings updated successfully",
-            data=settings_data
+            data=_setting_to_dict(setting),
         )
-        
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"Error updating settings: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error updating settings: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error updating settings: {str(e)}")
 
 
 @router.post("/reset-all", response_model=StandardResponse)

@@ -2,7 +2,8 @@ import logging
 import io
 import json
 import pandas as pd
-from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
 from datetime import datetime
 from app.schemas.stock_scanner import StockScannerRequest
@@ -291,42 +292,46 @@ async def get_scan_date_range():
 
 
 @router.post("/{scan_id}/restart-analysis", response_model=StandardResponse)
-async def restart_analysis(scan_id: int):
+async def restart_analysis(
+    scan_id: int,
+    program_id: Optional[str] = Body(None, embed=True),
+):
     """
     Restart analysis by creating a duplicate scan without analysis data.
-    
-    This endpoint:
-    1. Copies all current scan data into a new row (duplicate scan)
-    2. Does not copy any analysis data
-    3. Starts analysis for the duplicated scan
-    
-    Args:
-        scan_id: The ID of the scan to restart analysis for
-    
-    Returns the new scan ID and confirmation that analysis has been started.
+
+    Accepts an optional ``program_id`` body field to override the strategy set
+    used for the re-analysis (pass ``null`` / omit for "No Program – use
+    globally enabled strategies").
     """
     try:
-        logging.info(f"🔄 Restart analysis request for scan_id: {scan_id}")
-        
+        logging.info(f"🔄 Restart analysis request for scan_id: {scan_id}, program_id={program_id!r}")
+
         db = SessionLocal()
         try:
-            # Check if original scan exists
             original_scan = db.query(ScanRecord).filter(ScanRecord.id == scan_id).first()
             if not original_scan:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Scan with ID {scan_id} not found"
                 )
-            
+
+            # Build new criteria – copy original, then override program_id
+            new_criteria = dict(original_scan.criteria or {})
+            if program_id is not None and str(program_id).strip():
+                new_criteria["program_id"] = str(program_id).strip()
+            else:
+                new_criteria.pop("program_id", None)
+
+            logging.info(f"🔀 Restart criteria program_id resolved to: {new_criteria.get('program_id', '(no program)')!r}")
+
             # Create duplicate scan without analysis data
             new_scan = ScanRecord(
-                status="completed",  # Keep original scan status
+                status="completed",
                 scan_progress=original_scan.scan_progress,
-                criteria=original_scan.criteria,
+                criteria=new_criteria,
                 stock_symbols=original_scan.stock_symbols,
                 total_found=original_scan.total_found,
                 portfolio_size=original_scan.portfolio_size,
-                # Analysis fields are reset (None/default values)
                 analysis_results=None,
                 analysis_status=None,
                 analysis_progress=0,
