@@ -96,13 +96,12 @@ def _ensure_unified_analysis_schema(engine) -> None:
                 except Exception:
                     pass
 
-            # Global engine toggles
+            # Global engine toggles (adx_min column kept for DB backward compat but no longer used)
             _engine_cols = {
                 "strict_rules": "BOOLEAN NOT NULL DEFAULT TRUE",
                 "volume_spike_required": "BOOLEAN NOT NULL DEFAULT FALSE",
                 "use_intraday": "BOOLEAN NOT NULL DEFAULT FALSE",
                 "daily_loss_limit_pct": "DOUBLE PRECISION NOT NULL DEFAULT 0.02",
-                "adx_min": "DOUBLE PRECISION",
             }
             for col_name, col_def in _engine_cols.items():
                 if col_name not in settings_cols:
@@ -190,9 +189,12 @@ def create_tables():
                 "risk": {"stop_loss_atr_mult": 2.0, "take_profit_atr_mult": 4.0, "min_risk_reward": 2.0},
             },
             "Momentum": {
-                # Only Buy signals (no sell_rules), mirroring str code 9 momentum direction
+                # Buy-only (no sell_rules). Requires 3-day price surge >7%, volume
+                # >1.5× 20-day average, MACD bullish, and RSI <50 – mirroring str code 9.
                 "pre_filters": _STR9_PRE_FILTERS,
                 "buy_rules": [
+                    {"indicator": "price_change_3d", "operator": ">", "value": 7},
+                    {"indicator": "volume_ratio_20d", "operator": ">", "value": 1.5},
                     {"indicator": "macd", "operator": ">", "compare_to": "macd_signal"},
                     {"indicator": "rsi", "operator": "<", "value": 50},
                 ],
@@ -261,19 +263,17 @@ def create_tables():
                     db.commit()
                     logging.info("Seeded default strategies with buy/sell rule configs.")
                 else:
-                    # Update any existing strategy that has an empty / missing config
+                    # Always sync every strategy to the canonical str code 9 config so
+                    # thresholds, ATR multipliers and sell_rules stay consistent.
                     updated = 0
                     for strat in existing_strategies:
-                        if not strat.config or not (
-                            strat.config.get("buy_rules") or strat.config.get("sell_rules")
-                        ):
-                            new_cfg = _STRATEGY_CONFIGS.get(strat.name)
-                            if new_cfg:
-                                strat.config = new_cfg
-                                updated += 1
+                        new_cfg = _STRATEGY_CONFIGS.get(strat.name)
+                        if new_cfg and strat.config != new_cfg:
+                            strat.config = new_cfg
+                            updated += 1
                     if updated:
                         db.commit()
-                        logging.info(f"Migrated {updated} strategies with missing buy/sell rule configs.")
+                        logging.info(f"Updated {updated} strategies to match str code 9 canonical configs.")
             finally:
                 db.close()
         except Exception as seed_strat_error:
@@ -286,7 +286,6 @@ def create_tables():
             "enabled_strategy_names": ["Trend", "Momentum", "VWAP"],
             "rules": {
                 "strict_rules": True,
-                "adx_min": None,
                 "volume_spike_required": False,
             },
             "market": {"use_vix_filter": True},
@@ -311,12 +310,12 @@ def create_tables():
                     db.add(baseline)
                     db.commit()
                 else:
-                    # Migrate existing baseline to match str code 9:
-                    # adx/volume_spike live in each strategy's pre_filters, not as global rules.
+                    # Migrate existing baseline: remove legacy adx_min global rule (ADX now lives
+                    # in each strategy's pre_filters) and ensure min_risk_reward=2.0.
                     existing_rules = (baseline.config or {}).get("rules", {})
                     existing_risk = (baseline.config or {}).get("risk", {})
                     needs_update = (
-                        existing_rules.get("adx_min") is not None
+                        "adx_min" in existing_rules
                         or existing_rules.get("volume_spike_required") is True
                         or existing_risk.get("min_risk_reward", 0) != 2.0
                     )
@@ -324,7 +323,6 @@ def create_tables():
                         updated_config = dict(baseline.config or {})
                         updated_config["rules"] = {
                             "strict_rules": existing_rules.get("strict_rules", True),
-                            "adx_min": None,
                             "volume_spike_required": False,
                         }
                         updated_config["risk"] = {
@@ -333,13 +331,11 @@ def create_tables():
                         }
                         baseline.config = updated_config
                         db.commit()
-                        # Also sync active_config so scans without an explicit program_id
-                        # immediately pick up the corrected rules.
                         active = Settings.get_settings(db)
                         if getattr(active, "active_program_id", None) == "str_code_9":
                             Settings.set_active_program(db, "str_code_9", updated_config)
                             db.commit()
-                        logging.info("Migrated STR_CODE_9 baseline: adx_min=None, volume_spike_required=False, min_risk_reward=2.0.")
+                        logging.info("Migrated STR_CODE_9 baseline: removed global adx_min, volume_spike_required=False, min_risk_reward=2.0.")
 
                 # If nothing is active yet, set baseline as active.
                 active = Settings.get_settings(db)
@@ -350,6 +346,56 @@ def create_tables():
                 db.close()
         except Exception as seed_error:
             logging.warning(f"Could not seed baseline program: {seed_error}")
+
+        # STR CODE 18 – same strategies as str9 plus per-symbol backtest-based
+        # strategy filtering (min 10 trades, expectancy > 0, profit_factor > 1.2).
+        # Sentiment analysis (DistilBERT) is noted in the config but intentionally
+        # not run inside the API service to avoid heavy ML dependencies at runtime.
+        _STR18_CONFIG = {
+            "enabled_strategy_names": ["Trend", "Momentum", "VWAP"],
+            "rules": {
+                "strict_rules": True,
+                "volume_spike_required": False,
+                "backtest_filter": {
+                    "min_trades": 10,
+                    "min_expectancy": 0.0,
+                    "min_profit_factor": 1.2,
+                },
+            },
+            "market": {"use_vix_filter": True},
+            "risk": {
+                "daily_loss_limit_pct": 0.02,
+                "min_risk_reward": 2.0,
+            },
+        }
+
+        try:
+            db = SessionLocal()
+            try:
+                str18 = db.query(Program).filter(Program.program_id == "str_code_18").first()
+                if str18 is None:
+                    str18 = Program(
+                        program_id="str_code_18",
+                        name="STR CODE 18",
+                        is_baseline=False,
+                        config=_STR18_CONFIG,
+                    )
+                    db.add(str18)
+                    db.commit()
+                    logging.info("Seeded STR CODE 18 program.")
+                else:
+                    # Sync config to keep thresholds current.
+                    existing_bt_filter = (str18.config or {}).get("rules", {}).get("backtest_filter")
+                    if existing_bt_filter != _STR18_CONFIG["rules"]["backtest_filter"]:
+                        updated = dict(str18.config or {})
+                        updated["rules"] = _STR18_CONFIG["rules"]
+                        str18.config = updated
+                        db.commit()
+                        logging.info("Updated STR CODE 18 backtest_filter config.")
+            finally:
+                db.close()
+        except Exception as e:
+            logging.warning(f"Could not seed STR CODE 18 program: {e}")
 
         logging.info("Database tables created successfully")
     except Exception as e:

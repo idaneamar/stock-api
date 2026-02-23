@@ -59,7 +59,7 @@ class TradingAnalysisService:
         self.daily_loss = 0
         self.last_reset_date = datetime.now().date()
         self.risk_per_trade = 0.015  # 1.5%
-        self.min_risk_reward_ratio = 1.5
+        self.min_risk_reward_ratio = 2.0
         self.active_trades = {}
         self.logger = logging.getLogger(__name__)
         self._market_conditions_cache: Dict[str, tuple[bool, str, str]] = {}
@@ -184,6 +184,8 @@ class TradingAnalysisService:
             "adx",
             "macd",
             "macd_signal",
+            "price_change_3d",
+            "volume_ratio_20d",
         ]
         out: Dict[str, float] = {}
         for key in keys:
@@ -459,23 +461,34 @@ class TradingAnalysisService:
             df['atr'] = atr.where(atr > 0, (df['close'].pct_change().fillna(0).std() * df['close'] * 14))
             df['atr'] = df['atr'].where(df['atr'] > 0, 1.0)
             df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+            # Derived indicators used by momentum strategy (str code 9)
+            df['price_change_3d'] = df['close'].pct_change(3) * 100
+            df['volume_ratio_20d'] = df['volume'] / df['volume'].rolling(window=20).mean()
             return df
         except Exception as e:
             self.logger.error(f"Error in precompute_indicators for {symbol}: {e}")
             return df
 
     def trend_strategy(self, df, last):
-        """Trend-based trading strategy"""
+        """Trend-based trading with EMA, RSI, ADX, and MACD confirmation, matching str code 9."""
         try:
-            if (last['ema20'] > last['ema50'] and last['rsi'] < 50 and last['adx'] > 18):
+            if not last['volume_spike']:
+                return "Hold", None, None, None
+            if last['adx'] <= 30:
+                return "Hold", None, None, None
+            if (last['ema20'] > last['ema50']
+                    and last['rsi'] < 50
+                    and last['macd'] > last['macd_signal']):
                 signal = "Buy"
-                stop_loss = round(last['close'] - 1.75 * last['atr'], 2)
-                take_profit = round(last['close'] + 3.5 * last['atr'], 2)
+                stop_loss = round(last['close'] - 2 * last['atr'], 2)
+                take_profit = round(last['close'] + 4 * last['atr'], 2)
                 return signal, stop_loss, take_profit, "Trend"
-            elif (last['ema20'] < last['ema50'] and last['rsi'] > 50 and last['adx'] > 18):
+            elif (last['ema20'] < last['ema50']
+                  and last['rsi'] > 50
+                  and last['macd'] < last['macd_signal']):
                 signal = "Sell"
-                stop_loss = round(last['close'] + 1.75 * last['atr'], 2)
-                take_profit = round(last['close'] - 3.5 * last['atr'], 2)
+                stop_loss = round(last['close'] + 2 * last['atr'], 2)
+                take_profit = round(last['close'] - 4 * last['atr'], 2)
                 return signal, stop_loss, take_profit, "Trend"
             return "Hold", None, None, None
         except Exception as e:
@@ -483,27 +496,31 @@ class TradingAnalysisService:
             return "Hold", None, None, None
 
     def momentum_strategy(self, df, last):
-        """Momentum trading strategy"""
+        """Momentum strategy: Buy-only (no short selling), matching str code 9."""
         try:
+            if not last['volume_spike']:
+                return "Hold", None, None, None
+            if last['adx'] <= 30:
+                return "Hold", None, None, None
             if len(df) < 4:
                 return "Hold", None, None, None
             price_3ago = df['close'].shift(3).iloc[-1]
             if pd.isna(price_3ago) or price_3ago == 0:
                 return "Hold", None, None, None
-            price_change = (float(last['close']) - float(price_3ago)) / float(price_3ago) * 100
+            try:
+                price_change = (float(last['close']) - float(price_3ago)) / float(price_3ago) * 100
+            except ZeroDivisionError:
+                return "Hold", None, None, None
             volume_mean_20 = df['volume'].rolling(window=20).mean().iloc[-1]
             if pd.isna(volume_mean_20):
                 return "Hold", None, None, None
             volume_condition = float(last['volume']) > float(volume_mean_20) * 1.5
-            if price_change > 5 and volume_condition and float(last['adx']) > 20:
+            if price_change > 7 and volume_condition and last['macd'] > last['macd_signal']:
+                if last['rsi'] >= 50:
+                    return "Hold", None, None, None
                 signal = "Buy"
-                stop_loss = round(float(last['close']) - 1.5 * float(last['atr']), 2)
-                take_profit = round(float(last['close']) + 3.0 * float(last['atr']), 2)
-                return signal, stop_loss, take_profit, "Momentum"
-            elif price_change < -5 and volume_condition and float(last['adx']) > 20:
-                signal = "Sell"
-                stop_loss = round(float(last['close']) + 1.5 * float(last['atr']), 2)
-                take_profit = round(float(last['close']) - 3.0 * float(last['atr']), 2)
+                stop_loss = round(float(last['close']) - 2 * float(last['atr']), 2)
+                take_profit = round(float(last['close']) + 4 * float(last['atr']), 2)
                 return signal, stop_loss, take_profit, "Momentum"
             return "Hold", None, None, None
         except Exception as e:
@@ -555,17 +572,23 @@ class TradingAnalysisService:
             return "Hold", None, None, None
 
     def vwap_strategy(self, df, last):
-        """VWAP trading strategy"""
+        """VWAP strategy with dynamic threshold (VWAP±0.5×ATR), matching str code 9."""
         try:
-            if last['close'] < last['vwap'] * 0.98 and last['rsi'] < 40:
+            if not last['volume_spike']:
+                return "Hold", None, None, None
+            if last['adx'] <= 30:
+                return "Hold", None, None, None
+            buy_threshold = last['vwap'] - 0.5 * last['atr']
+            sell_threshold = last['vwap'] + 0.5 * last['atr']
+            if last['close'] < buy_threshold and last['rsi'] < 50 and last['macd'] > last['macd_signal']:
                 signal = "Buy"
-                stop_loss = round(last['close'] - 1.0 * last['atr'], 2)
-                take_profit = round(last['vwap'], 2)
+                stop_loss = round(last['close'] - 1.5 * last['atr'], 2)
+                take_profit = round(last['vwap'] * 1.04, 2)
                 return signal, stop_loss, take_profit, "VWAP"
-            elif last['close'] > last['vwap'] * 1.02 and last['rsi'] > 60:
+            elif last['close'] > sell_threshold and last['rsi'] > 50 and last['macd'] < last['macd_signal']:
                 signal = "Sell"
-                stop_loss = round(last['close'] + 1.0 * last['atr'], 2)
-                take_profit = round(last['vwap'], 2)
+                stop_loss = round(last['close'] + 1.5 * last['atr'], 2)
+                take_profit = round(last['vwap'] * 0.96, 2)
                 return signal, stop_loss, take_profit, "VWAP"
             return "Hold", None, None, None
         except Exception as e:
@@ -589,10 +612,11 @@ class TradingAnalysisService:
             entry_time = None
             entry_stop_loss = None
             entry_take_profit = None
+            entry_atr = 0
             capital = self.capital
             daily_loss = 0
             last_reset_date = df.index[0]
-            strategy_results = {"Trend": [], "Momentum": [], "Breakout": [], "Mean Reversion": [], "VWAP": []}
+            strategy_results = {"Trend": [], "Momentum": [], "VWAP": []}
 
             for i in range(50, len(df)):
                 if i % 1000 == 0:
@@ -613,12 +637,11 @@ class TradingAnalysisService:
                 take_profit = None
                 strategy = None
 
+                # Only use the three str code 9 strategies
                 strategies = [
                     self.trend_strategy,
                     self.momentum_strategy,
-                    self.breakout_strategy,
-                    self.mean_reversion_strategy,
-                    self.vwap_strategy
+                    self.vwap_strategy,
                 ]
 
                 for strat_func in strategies:
@@ -633,6 +656,7 @@ class TradingAnalysisService:
                     entry_time = subset.index[-1]
                     entry_stop_loss = stop_loss
                     entry_take_profit = take_profit
+                    entry_atr = last['atr']
                     position_size = int((self.capital * self.risk_per_trade) / (entry_price - entry_stop_loss)) if (entry_price - entry_stop_loss) > 0 else 1
                     position_size = max(1, position_size)
                 elif signal == "Sell" and position is None:
@@ -641,10 +665,18 @@ class TradingAnalysisService:
                     entry_time = subset.index[-1]
                     entry_stop_loss = stop_loss
                     entry_take_profit = take_profit
+                    entry_atr = last['atr']
                     position_size = int((self.capital * self.risk_per_trade) / (entry_stop_loss - entry_price)) if (entry_stop_loss - entry_price) > 0 else 1
                     position_size = max(1, position_size)
                 elif position is not None:
                     current_price = last['close']
+                    profit_so_far = (current_price - entry_price) if position == "long" else (entry_price - current_price)
+                    # Trailing stop: once profit exceeds 2×ATR, lock in 1×ATR above entry
+                    if profit_so_far > 2 * entry_atr:
+                        if position == "long":
+                            entry_stop_loss = max(entry_stop_loss, entry_price + 1 * entry_atr)
+                        else:
+                            entry_stop_loss = min(entry_stop_loss, entry_price - 1 * entry_atr)
                     if position == "long" and entry_take_profit is not None and entry_stop_loss is not None:
                         if current_price >= entry_take_profit or current_price <= entry_stop_loss:
                             profit = (current_price - entry_price) * position_size
@@ -696,10 +728,19 @@ class TradingAnalysisService:
                 strat_trades = len(profits)
                 strat_win_rate = (len([p for p in profits if p > 0]) / strat_trades * 100) if strat_trades > 0 else 0
                 strat_profit = sum(profits)
+                expectancy = strat_profit / strat_trades if strat_trades > 0 else 0.0
+                gross_profit = sum(p for p in profits if p > 0)
+                gross_loss = sum(p for p in profits if p < 0)
+                if gross_loss < 0:
+                    profit_factor = gross_profit / abs(gross_loss) if abs(gross_loss) > 0 else float('inf')
+                else:
+                    profit_factor = float('inf') if gross_profit > 0 else 0.0
                 strategy_summary[strat] = {
                     "total_trades": strat_trades,
                     "win_rate": strat_win_rate,
-                    "total_profit": strat_profit
+                    "total_profit": strat_profit,
+                    "expectancy": expectancy,
+                    "profit_factor": profit_factor,
                 }
 
             end_time = datetime.now()
@@ -787,8 +828,28 @@ class TradingAnalysisService:
                 self.logger.info(f"Skipping {symbol}: Daily loss limit reached")
                 return []
 
+            # str18: per-symbol backtest-based strategy filtering
+            active_strategies = list(strategies or [])
+            backtest_filter = (rules_config or {}).get("backtest_filter")
+            if backtest_filter and active_strategies:
+                min_trades = int(backtest_filter.get("min_trades", 10))
+                min_expectancy = float(backtest_filter.get("min_expectancy", 0.0))
+                min_pf = float(backtest_filter.get("min_profit_factor", 1.2))
+                sym_bt = self.backtest_results.get(symbol, {}).get("strategy_summary", {})
+                filtered = [
+                    s for s in active_strategies
+                    if (
+                        sym_bt.get(s.name, {}).get("total_trades", 0) >= min_trades
+                        and sym_bt.get(s.name, {}).get("expectancy", 0.0) > min_expectancy
+                        and sym_bt.get(s.name, {}).get("profit_factor", 0.0) > min_pf
+                    )
+                ]
+                if filtered:
+                    active_strategies = filtered
+                # else: fallback – use all strategies (mirrors str18 fallback logic)
+
             valid_signals: List[Dict] = []
-            for strat in strategies or []:
+            for strat in active_strategies:
                 if not getattr(strat, "enabled", False):
                     continue
                 valid_signals.extend(self._evaluate_strategy(strat, df, last))
@@ -908,28 +969,15 @@ class TradingAnalysisService:
             })
 
             # --- Strict rules / mandatory filters (single source: UI / Program config) ---
+            # Note: ADX is no longer a global filter – it is configured per-strategy
+            # via each strategy's pre_filters (e.g. adx > 30 in STR9 strategies).
             cfg = rules_config or {}
             strict = bool(cfg.get("strict_rules", True))
             reasons = []
 
             # Enforce only if the recommendation is actionable
             if results[-1].get("recommendation") in ("Buy", "Sell"):
-                # ADX minimum
-                adx_min = cfg.get("adx_min", None)
-                try:
-                    adx_min = float(adx_min) if adx_min is not None else None
-                except Exception:
-                    adx_min = None
-
-                try:
-                    adx_val = float(results[-1].get("adx", 0.0) or 0.0)
-                except Exception:
-                    adx_val = 0.0
-
-                if adx_min is not None and adx_val < adx_min:
-                    reasons.append(f"ADX<{adx_min:g}")
-
-                # Volume Spike mandatory
+                # Volume Spike mandatory (global toggle)
                 volume_required = bool(cfg.get("volume_spike_required", False))
                 if volume_required and not bool(results[-1].get("volume_spike", False)):
                     reasons.append("VolumeSpike=FALSE")
@@ -1187,16 +1235,18 @@ class TradingAnalysisService:
             # Resolve engine toggles: criteria > Settings DB > program config > hardcoded default
             global_settings = Settings.get_settings(db)
 
+            # adx_min has been removed from global settings – ADX is now configured
+            # per-strategy via each strategy's pre_filters.
             rules_cfg = dict((effective_config.get("rules") or {}))
-            for k in ("strict_rules", "adx_min", "volume_spike_required"):
+            for k in ("strict_rules", "volume_spike_required"):
                 if k in criteria and criteria.get(k) is not None:
-                    # Explicit per-scan value wins
                     rules_cfg[k] = criteria.get(k)
                 elif not rules_cfg.get(k):
-                    # Fall back to global Settings row
                     gs_val = getattr(global_settings, k, None)
                     if gs_val is not None:
                         rules_cfg[k] = gs_val
+            # Drop any stale adx_min that may linger in stored program configs
+            rules_cfg.pop("adx_min", None)
             effective_config["rules"] = rules_cfg
 
             # allow_intraday_prices: criteria > Settings
