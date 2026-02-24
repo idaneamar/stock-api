@@ -11,7 +11,7 @@ Key behavior:
 - Compatible with your backtest_optsp_system.py call style: pick_iron_condors(chain) works (ticker/run_date inferred).
 
 Dependencies:
-  pip install requests pandas numpy scipy openpyxl pyarrow
+  pip install requests pandas numpy openpyxl pyarrow
 
 Env:
   export EODHD_API_TOKEN="..."
@@ -34,7 +34,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import numpy as np
 import pandas as pd
-from scipy.stats import lognorm
 
 # =========================
 # BASE / PATHS
@@ -472,6 +471,18 @@ def fetch_chain_for_ticker(
 # =========================
 # Pricing helpers
 # =========================
+_SQRT2 = math.sqrt(2.0)
+
+def _norm_cdf(z: float) -> float:
+    """Standard normal CDF using erf (no SciPy dependency)."""
+    return 0.5 * (1.0 + math.erf(z / _SQRT2))
+
+def _lognorm_cdf(x: float, *, mu: float, sigma: float) -> float:
+    """Log-normal CDF for X ~ LogNormal(mu, sigma)."""
+    if x <= 0 or sigma <= 0:
+        return 0.0
+    return _norm_cdf((math.log(x) - mu) / sigma)
+
 def _mid(bid: float, ask: float) -> float:
     if bid is None or ask is None or np.isnan(bid) or np.isnan(ask):
         return np.nan
@@ -508,8 +519,8 @@ def _calc_pop_lognormal(spot: float, low: float, high: float, iv: float, dte: in
         if sigma <= 0:
             return None
         mu = math.log(spot)
-        cdf_high = lognorm.cdf(high, s=sigma, scale=math.exp(mu))
-        cdf_low = lognorm.cdf(low, s=sigma, scale=math.exp(mu))
+        cdf_high = _lognorm_cdf(high, mu=mu, sigma=sigma)
+        cdf_low = _lognorm_cdf(low, mu=mu, sigma=sigma)
         p = float(cdf_high - cdf_low)
         return max(0.0, min(1.0, p))
     except Exception:
