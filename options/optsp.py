@@ -436,6 +436,11 @@ def fetch_chain_for_ticker(
             except Exception as e:
                 logging.warning(f"Fallback cache read failed: {fallback_path} err={e}")
 
+        # No cache found at all in cache-only mode → skip this ticker immediately.
+        # Do NOT fall through to the live API call; that would stall for minutes per ticker.
+        logging.debug(f"[cache-only] No cache for {ticker} — skipping")
+        return pd.DataFrame()
+
     d0 = datetime.fromisoformat(run_date).date()
     exp_from = (d0 + timedelta(days=max(1, target_dte - dte_tol))).isoformat()
     exp_to = (d0 + timedelta(days=target_dte + dte_tol)).isoformat()
