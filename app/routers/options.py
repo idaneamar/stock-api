@@ -652,6 +652,15 @@ def trigger_run_optsp(req: RunOptspRequest, background_tasks: BackgroundTasks):
 
 
 def _bg_run_optsp(run_date: str, cache_only: bool, job_id: str) -> None:
+    # If symbols are missing, fetch them first so optsp has a universe.
+    try:
+        symbols = svc.get_symbols()
+        if not symbols:
+            logger.info("[trigger] No symbols found – running fetch_sp500_symbols first...")
+            svc.run_fetch_sp500()
+    except Exception as exc:
+        logger.warning(f"[trigger] fetch_sp500_symbols pre-step failed: {exc}")
+
     result = svc.run_optsp(run_date=run_date, cache_only=cache_only, job_id=job_id)
     if result["ok"]:
         logger.info(f"[trigger] optsp OK for {run_date}")
