@@ -7,7 +7,9 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings as config_settings
 from app.schemas.response import ErrorResponse
 from app.models.init_db import create_tables
-from app.routers import scans, analysis, websocket, settings, trades, strategies, programs, ai
+from app.routers import scans, analysis, websocket, settings, trades, strategies, programs, ai, options as options_router
+from app.services.options_scheduler import start_options_scheduler, stop_options_scheduler
+from app.services.options_service import warm_ticker_summaries_cache
 
 # -----------------------------
 # Logging (configure early)
@@ -41,7 +43,29 @@ if not PUBLIC_WS_URL:
 # -----------------------------
 # FastAPI App
 # -----------------------------
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    # Startup
+    try:
+        start_options_scheduler()
+    except Exception as exc:
+        logger.warning(f"Options scheduler failed to start: {exc}")
+    # Pre-compute P&L summaries in background (so first AI chat is fast)
+    try:
+        warm_ticker_summaries_cache(start_year=2023)
+    except Exception as exc:
+        logger.warning(f"Options P&L cache warm-up failed: {exc}")
+    yield
+    # Shutdown
+    try:
+        stop_options_scheduler()
+    except Exception:
+        pass
+
 app = FastAPI(
+    lifespan=lifespan,
     title=config_settings.PROJECT_NAME,
     version=config_settings.VERSION,
     description=f"""{config_settings.DESCRIPTION}
@@ -113,6 +137,7 @@ app.include_router(strategies.router)
 app.include_router(programs.router)
 app.include_router(trades.router)
 app.include_router(ai.router)
+app.include_router(options_router.router)
 
 # -----------------------------
 # Exception handlers

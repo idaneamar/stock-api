@@ -14,7 +14,7 @@ class Settings(Base):
 
     # Global engine toggles – applied to every scan unless overridden per-scan
     strict_rules = Column(Boolean, nullable=False, default=True)
-    adx_min = Column(Float, nullable=True)
+    adx_min = Column(Float, nullable=True)  # Deprecated: ADX is now configured per-strategy via pre_filters
     volume_spike_required = Column(Boolean, nullable=False, default=False)
     use_intraday = Column(Boolean, nullable=False, default=False)
     daily_loss_limit_pct = Column(Float, nullable=False, default=0.02)

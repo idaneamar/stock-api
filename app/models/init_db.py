@@ -166,7 +166,7 @@ def create_tables():
         # Strategy configs matching str code 9 exactly:
         # - Pre-filters: volume_spike required + ADX > 30
         # - Trend/Momentum: SL=2×ATR, TP=4×ATR
-        # - VWAP: SL=1.5×ATR, TP=3×ATR (≥2.0 R:R), dynamic threshold vs VWAP±0.5×ATR
+        # - VWAP: SL=1.5×ATR, TP=VWAP×(±4%), dynamic threshold vs VWAP±0.5×ATR
         # - All with MACD confirmation and min R:R = 2.0
         _STR9_PRE_FILTERS = [
             {"indicator": "volume_spike", "operator": "==", "value": 1},
@@ -214,7 +214,16 @@ def create_tables():
                     {"indicator": "rsi", "operator": ">", "value": 50},
                     {"indicator": "macd", "operator": "<", "compare_to": "macd_signal"},
                 ],
-                "risk": {"stop_loss_atr_mult": 1.5, "take_profit_atr_mult": 3.0, "min_risk_reward": 2.0},
+                "risk": {
+                    "stop_loss_atr_mult": 1.5,
+                    # STR9: TP is VWAP ±4% (mean reversion), not ATR-multiple.
+                    "take_profit_mode": "vwap_mult",
+                    "take_profit_vwap_mult_buy": 1.04,
+                    "take_profit_vwap_mult_sell": 0.96,
+                    # Keep for backward compatibility; ignored when take_profit_mode=vwap_mult.
+                    "take_profit_atr_mult": 3.0,
+                    "min_risk_reward": 2.0,
+                },
             },
             "Breakout": {
                 "pre_filters": _STR9_PRE_FILTERS,
@@ -287,6 +296,14 @@ def create_tables():
             "rules": {
                 "strict_rules": True,
                 "volume_spike_required": False,
+                # Strategy selection by per-symbol backtest performance (STR9).
+                "backtest_filter": {
+                    "min_trades": 10,
+                    "min_expectancy": 0.0,
+                    "min_profit_factor": 1.2,
+                },
+                # If none qualify → fallback order.
+                "fallback_order": ["VWAP", "Trend", "Momentum"],
             },
             "market": {"use_vix_filter": True},
             "risk": {
@@ -314,9 +331,13 @@ def create_tables():
                     # in each strategy's pre_filters) and ensure min_risk_reward=2.0.
                     existing_rules = (baseline.config or {}).get("rules", {})
                     existing_risk = (baseline.config or {}).get("risk", {})
+                    desired_bt = _BASELINE_CONFIG["rules"]["backtest_filter"]
+                    desired_fb = _BASELINE_CONFIG["rules"]["fallback_order"]
                     needs_update = (
                         "adx_min" in existing_rules
                         or existing_rules.get("volume_spike_required") is True
+                        or existing_rules.get("backtest_filter") != desired_bt
+                        or existing_rules.get("fallback_order") != desired_fb
                         or existing_risk.get("min_risk_reward", 0) != 2.0
                     )
                     if needs_update:
@@ -324,6 +345,8 @@ def create_tables():
                         updated_config["rules"] = {
                             "strict_rules": existing_rules.get("strict_rules", True),
                             "volume_spike_required": False,
+                            "backtest_filter": desired_bt,
+                            "fallback_order": desired_fb,
                         }
                         updated_config["risk"] = {
                             "daily_loss_limit_pct": existing_risk.get("daily_loss_limit_pct", 0.02),
@@ -335,7 +358,7 @@ def create_tables():
                         if getattr(active, "active_program_id", None) == "str_code_9":
                             Settings.set_active_program(db, "str_code_9", updated_config)
                             db.commit()
-                        logging.info("Migrated STR_CODE_9 baseline: removed global adx_min, volume_spike_required=False, min_risk_reward=2.0.")
+                        logging.info("Migrated STR_CODE_9 baseline: removed global adx_min, volume_spike_required=False, backtest_filter+fallback_order enabled, min_risk_reward=2.0.")
 
                 # If nothing is active yet, set baseline as active.
                 active = Settings.get_settings(db)

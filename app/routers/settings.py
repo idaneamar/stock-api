@@ -24,7 +24,6 @@ def _setting_to_dict(s: Settings) -> dict:
     return {
         "portfolio_size": s.portfolio_size,
         "strict_rules": bool(s.strict_rules) if s.strict_rules is not None else True,
-        "adx_min": s.adx_min,
         "volume_spike_required": bool(s.volume_spike_required) if s.volume_spike_required is not None else False,
         "use_intraday": bool(s.use_intraday) if s.use_intraday is not None else False,
         "daily_loss_limit_pct": float(s.daily_loss_limit_pct) if s.daily_loss_limit_pct is not None else 0.02,
@@ -38,7 +37,6 @@ class UpdateSettingsRequest(BaseModel):
         description="Total portfolio size in USD (minimum 1,000)",
     )
     strict_rules: Optional[bool] = Field(None, description="Enforce buy/sell rules as hard filters")
-    adx_min: Optional[float] = Field(None, description="Global minimum ADX (null = no minimum)")
     volume_spike_required: Optional[bool] = Field(None, description="Require volume spike for any signal")
     use_intraday: Optional[bool] = Field(None, description="Use intraday/real-time price when available")
     daily_loss_limit_pct: Optional[float] = Field(None, description="Daily max loss limit as fraction (e.g. 0.02)")
@@ -70,8 +68,6 @@ async def update_settings(request: UpdateSettingsRequest, db: Session = Depends(
         # Engine toggles – only update fields the client explicitly sent
         if request.strict_rules is not None:
             setting.strict_rules = request.strict_rules
-        # adx_min is allowed to be None (clears the minimum)
-        setting.adx_min = request.adx_min
         if request.volume_spike_required is not None:
             setting.volume_spike_required = request.volume_spike_required
         if request.use_intraday is not None:

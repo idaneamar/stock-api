@@ -1,5 +1,6 @@
 from typing import List
 from pydantic_settings import BaseSettings
+from pydantic_settings import SettingsConfigDict
 from pydantic import AnyHttpUrl
 import os
 from dotenv import load_dotenv
@@ -7,6 +8,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings(BaseSettings):
+    # Ignore unrelated environment variables (e.g. OPENAI_API_KEY) so the app
+    # can run in shared environments without crashing.
+    model_config = SettingsConfigDict(
+        case_sensitive=True,
+        env_file=".env",
+        extra="ignore",
+    )
+
     PROJECT_NAME: str = "Stock FastAPI"
     VERSION: str = "1.0.0"
     DESCRIPTION: str = "A FastAPI application for stock management"
@@ -28,9 +37,5 @@ class Settings(BaseSettings):
     DEBUG: bool = os.getenv("DEBUG", "True").lower() in ("true", "1", "yes")
     RELOAD: bool = os.getenv("RELOAD", "True").lower() in ("true", "1", "yes")
     PORT: int = int(os.getenv("PORT", "8000"))
-    
-    class Config:
-        case_sensitive = True
-        env_file = ".env"
 
 settings = Settings()

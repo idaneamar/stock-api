@@ -205,9 +205,19 @@ class TradingAnalysisService:
         if not isinstance(cfg, dict):
             return []
 
+        # STR9 invariant: Momentum strategy is BUY-only (never short).
+        # Even if a DB config accidentally defines sell_rules, we hard-disable them.
+        try:
+            strat_name_norm = str(getattr(strategy, "name", "") or "").strip().lower()
+        except Exception:
+            strat_name_norm = ""
+
         risk_cfg = cfg.get("risk") if isinstance(cfg.get("risk"), dict) else {}
         stop_mult = float((risk_cfg or {}).get("stop_loss_atr_mult", 1.5) or 1.5)
         take_mult = float((risk_cfg or {}).get("take_profit_atr_mult", 3.0) or 3.0)
+        take_mode = str((risk_cfg or {}).get("take_profit_mode", "atr_mult") or "atr_mult").strip().lower()
+        take_vwap_mult_buy = float((risk_cfg or {}).get("take_profit_vwap_mult_buy", 1.04) or 1.04)
+        take_vwap_mult_sell = float((risk_cfg or {}).get("take_profit_vwap_mult_sell", 0.96) or 0.96)
         min_rr = float((risk_cfg or {}).get("min_risk_reward", self.min_risk_reward_ratio) or self.min_risk_reward_ratio)
 
         values = self._extract_latest_values(last_row)
@@ -224,12 +234,20 @@ class TradingAnalysisService:
         sell_rules = cfg.get("sell_rules")
         if buy_rules is None and cfg.get("rules") is not None:
             buy_rules = cfg.get("rules")
+        if strat_name_norm == "momentum":
+            sell_rules = []
 
         candidates: List[Dict] = []
 
-        if isinstance(buy_rules, list) and self._rules_pass(buy_rules, values):
+        if buy_rules and isinstance(buy_rules, list) and self._rules_pass(buy_rules, values):
             stop_loss = entry - stop_mult * atr
-            take_profit = entry + take_mult * atr
+            if take_mode == "vwap_mult":
+                vwap = float(values.get("vwap", 0.0) or 0.0)
+                if vwap <= 0:
+                    return []
+                take_profit = vwap * take_vwap_mult_buy
+            else:
+                take_profit = entry + take_mult * atr
             risk = abs(entry - stop_loss)
             reward = abs(take_profit - entry)
             rr = (reward / risk) if risk > 0 else 0.0
@@ -245,9 +263,15 @@ class TradingAnalysisService:
                     }
                 )
 
-        if isinstance(sell_rules, list) and self._rules_pass(sell_rules, values):
+        if sell_rules and isinstance(sell_rules, list) and self._rules_pass(sell_rules, values):
             stop_loss = entry + stop_mult * atr
-            take_profit = entry - take_mult * atr
+            if take_mode == "vwap_mult":
+                vwap = float(values.get("vwap", 0.0) or 0.0)
+                if vwap <= 0:
+                    return []
+                take_profit = vwap * take_vwap_mult_sell
+            else:
+                take_profit = entry - take_mult * atr
             risk = abs(stop_loss - entry)
             reward = abs(entry - take_profit)
             rr = (reward / risk) if risk > 0 else 0.0
@@ -606,111 +630,117 @@ class TradingAnalysisService:
                 return None
 
             df = self.precompute_indicators(symbol, df)
-            trades = []
-            position = None
-            entry_price = 0
-            entry_time = None
-            entry_stop_loss = None
-            entry_take_profit = None
-            entry_atr = 0
-            capital = self.capital
-            daily_loss = 0
-            last_reset_date = df.index[0]
-            strategy_results = {"Trend": [], "Momentum": [], "VWAP": []}
+            def _simulate_one_strategy(strat_func, strat_name: str):
+                """Simulate one strategy independently (no cross-strategy interference, no lookahead)."""
+                trades_local = []
+                profits_local = []
+                position = None  # "long" | "short" | None
+                entry_price = 0.0
+                entry_time = None
+                entry_stop_loss = None
+                entry_take_profit = None
+                entry_atr = 0.0
+                position_size = 0
 
-            for i in range(50, len(df)):
-                if i % 1000 == 0:
-                    self.logger.info(f"Backtest for {symbol}: Processed {i} of {len(df)} rows")
-                subset = df.iloc[:i+1]
-                last = subset.iloc[-1]
-                current_date = subset.index[-1]
+                for i in range(50, len(df)):
+                    subset = df.iloc[: i + 1]
+                    last = subset.iloc[-1]
 
-                if current_date != last_reset_date:
-                    daily_loss = 0
-                    last_reset_date = current_date
+                    try:
+                        current_price = float(last["close"])
+                        atr_val = float(last.get("atr", 0.0) or 0.0)
+                    except Exception:
+                        continue
 
-                if daily_loss >= self.capital * self.daily_loss_limit:
-                    continue
+                    signal, stop_loss, take_profit, _ = strat_func(subset, last)
 
-                signal = "Hold"
-                stop_loss = None
-                take_profit = None
-                strategy = None
+                    if position is None:
+                        if signal == "Buy":
+                            position = "long"
+                            entry_price = current_price
+                            entry_time = subset.index[-1]
+                            entry_stop_loss = float(stop_loss) if stop_loss is not None else None
+                            entry_take_profit = float(take_profit) if take_profit is not None else None
+                            entry_atr = atr_val
+                            risk_per_share = abs(entry_price - entry_stop_loss) if entry_stop_loss is not None else 0.0
+                            risk_amount = float(self.capital) * float(self.risk_per_trade)
+                            position_size = int(risk_amount / risk_per_share) if risk_per_share > 0 else 1
+                            position_size = max(1, position_size)
+                        elif signal == "Sell":
+                            position = "short"
+                            entry_price = current_price
+                            entry_time = subset.index[-1]
+                            entry_stop_loss = float(stop_loss) if stop_loss is not None else None
+                            entry_take_profit = float(take_profit) if take_profit is not None else None
+                            entry_atr = atr_val
+                            risk_per_share = abs(entry_stop_loss - entry_price) if entry_stop_loss is not None else 0.0
+                            risk_amount = float(self.capital) * float(self.risk_per_trade)
+                            position_size = int(risk_amount / risk_per_share) if risk_per_share > 0 else 1
+                            position_size = max(1, position_size)
+                        continue
 
-                # Only use the three str code 9 strategies
-                strategies = [
-                    self.trend_strategy,
-                    self.momentum_strategy,
-                    self.vwap_strategy,
-                ]
-
-                for strat_func in strategies:
-                    signal, stop_loss, take_profit, strat_name = strat_func(df, last)
-                    if signal in ["Buy", "Sell"]:
-                        strategy = strat_name
-                        break
-
-                if signal == "Buy" and position is None:
-                    position = "long"
-                    entry_price = last['close']
-                    entry_time = subset.index[-1]
-                    entry_stop_loss = stop_loss
-                    entry_take_profit = take_profit
-                    entry_atr = last['atr']
-                    position_size = int((self.capital * self.risk_per_trade) / (entry_price - entry_stop_loss)) if (entry_price - entry_stop_loss) > 0 else 1
-                    position_size = max(1, position_size)
-                elif signal == "Sell" and position is None:
-                    position = "short"
-                    entry_price = last['close']
-                    entry_time = subset.index[-1]
-                    entry_stop_loss = stop_loss
-                    entry_take_profit = take_profit
-                    entry_atr = last['atr']
-                    position_size = int((self.capital * self.risk_per_trade) / (entry_stop_loss - entry_price)) if (entry_stop_loss - entry_price) > 0 else 1
-                    position_size = max(1, position_size)
-                elif position is not None:
-                    current_price = last['close']
+                    # Manage open position
                     profit_so_far = (current_price - entry_price) if position == "long" else (entry_price - current_price)
-                    # Trailing stop: once profit exceeds 2×ATR, lock in 1×ATR above entry
-                    if profit_so_far > 2 * entry_atr:
+                    if entry_atr > 0 and profit_so_far > 2 * entry_atr and entry_stop_loss is not None:
                         if position == "long":
                             entry_stop_loss = max(entry_stop_loss, entry_price + 1 * entry_atr)
                         else:
                             entry_stop_loss = min(entry_stop_loss, entry_price - 1 * entry_atr)
-                    if position == "long" and entry_take_profit is not None and entry_stop_loss is not None:
-                        if current_price >= entry_take_profit or current_price <= entry_stop_loss:
+
+                    if entry_take_profit is None or entry_stop_loss is None:
+                        continue
+
+                    if position == "long":
+                        hit = current_price >= entry_take_profit or current_price <= entry_stop_loss
+                        if hit:
                             profit = (current_price - entry_price) * position_size
-                            capital += profit
-                            daily_loss -= profit
-                            trades.append({
-                                "symbol": symbol,
-                                "entry_time": entry_time,
-                                "exit_time": subset.index[-1],
-                                "entry_price": entry_price,
-                                "exit_price": current_price,
-                                "profit": profit,
-                                "type": "long",
-                                "strategy": strategy
-                            })
-                            strategy_results[strategy].append(profit)
+                            trades_local.append(
+                                {
+                                    "symbol": symbol,
+                                    "entry_time": entry_time,
+                                    "exit_time": subset.index[-1],
+                                    "entry_price": entry_price,
+                                    "exit_price": current_price,
+                                    "profit": profit,
+                                    "type": "long",
+                                    "strategy": strat_name,
+                                }
+                            )
+                            profits_local.append(profit)
                             position = None
-                    elif position == "short" and entry_take_profit is not None and entry_stop_loss is not None:
-                        if current_price <= entry_take_profit or current_price >= entry_stop_loss:
+                    else:
+                        hit = current_price <= entry_take_profit or current_price >= entry_stop_loss
+                        if hit:
                             profit = (entry_price - current_price) * position_size
-                            capital += profit
-                            daily_loss -= profit
-                            trades.append({
-                                "symbol": symbol,
-                                "entry_time": entry_time,
-                                "exit_time": subset.index[-1],
-                                "entry_price": entry_price,
-                                "exit_price": current_price,
-                                "profit": profit,
-                                "type": "short",
-                                "strategy": strategy
-                            })
-                            strategy_results[strategy].append(profit)
+                            trades_local.append(
+                                {
+                                    "symbol": symbol,
+                                    "entry_time": entry_time,
+                                    "exit_time": subset.index[-1],
+                                    "entry_price": entry_price,
+                                    "exit_price": current_price,
+                                    "profit": profit,
+                                    "type": "short",
+                                    "strategy": strat_name,
+                                }
+                            )
+                            profits_local.append(profit)
                             position = None
+
+                return trades_local, profits_local
+
+            # Backtest each STR9 strategy independently (matches how we later gate by per-strategy stats)
+            strategy_funcs = {
+                "Trend": self.trend_strategy,
+                "Momentum": self.momentum_strategy,
+                "VWAP": self.vwap_strategy,
+            }
+            strategy_results = {"Trend": [], "Momentum": [], "VWAP": []}
+            trades = []
+            for name, fn in strategy_funcs.items():
+                t, p = _simulate_one_strategy(fn, name)
+                trades.extend(t)
+                strategy_results[name] = list(p)
 
             total_trades = len(trades)
             winning_trades = len([t for t in trades if t['profit'] > 0])
@@ -789,6 +819,7 @@ class TradingAnalysisService:
         ignore_vix: bool = False,
         rules_config: Optional[Dict] = None,
         allow_intraday_prices: bool = False,
+        ignore_strategy_enabled: bool = False,
     ):
         """Analyze a single symbol and generate trading recommendations"""
         try:
@@ -846,13 +877,62 @@ class TradingAnalysisService:
                 ]
                 if filtered:
                     active_strategies = filtered
-                # else: fallback – use all strategies (mirrors str18 fallback logic)
+                else:
+                    # Fallback order when no strategies qualify by backtest (str code 9).
+                    fallback_order = (rules_config or {}).get("fallback_order") or ["VWAP", "Trend", "Momentum"]
+                    ordered = []
+                    for name in fallback_order:
+                        match = next((s for s in active_strategies if s.name == name), None)
+                        if match is not None:
+                            ordered.append(match)
+                    if ordered:
+                        active_strategies = ordered
 
             valid_signals: List[Dict] = []
-            for strat in active_strategies:
-                if not getattr(strat, "enabled", False):
-                    continue
-                valid_signals.extend(self._evaluate_strategy(strat, df, last))
+            use_canonical_str9 = bool((rules_config or {}).get("use_canonical_str9"))
+            if use_canonical_str9:
+                # Canonical STR9 evaluation path: guarantees Momentum is BUY-only and
+                # uses the exact hardcoded Trend/Momentum/VWAP rules.
+                fn_by_name = {
+                    "Trend": self.trend_strategy,
+                    "Momentum": self.momentum_strategy,
+                    "VWAP": self.vwap_strategy,
+                }
+                entry = float(last.get("close", 0.0) or 0.0)
+                for strat in active_strategies:
+                    if not ignore_strategy_enabled and not bool(getattr(strat, "enabled", False)):
+                        continue
+                    fn = fn_by_name.get(getattr(strat, "name", None))
+                    if fn is None:
+                        continue
+                    signal, stop_loss, take_profit, strat_name = fn(df, last)
+                    if signal not in ("Buy", "Sell") or stop_loss is None or take_profit is None or entry <= 0:
+                        continue
+                    try:
+                        sl = float(stop_loss)
+                        tp = float(take_profit)
+                    except Exception:
+                        continue
+                    risk = abs(entry - sl)
+                    reward = abs(tp - entry) if signal == "Buy" else abs(entry - tp)
+                    rr = (reward / risk) if risk > 0 else 0.0
+                    if rr < float(self.min_risk_reward_ratio):
+                        continue
+                    valid_signals.append(
+                        {
+                            "signal": signal,
+                            "stop_loss": round(sl, 2),
+                            "take_profit": round(tp, 2),
+                            "strategy_id": getattr(strat, "id", None),
+                            "strategy_name": strat_name or getattr(strat, "name", "-"),
+                            "risk_reward_ratio": rr,
+                        }
+                    )
+            else:
+                for strat in active_strategies:
+                    if not ignore_strategy_enabled and not bool(getattr(strat, "enabled", False)):
+                        continue
+                    valid_signals.extend(self._evaluate_strategy(strat, df, last))
 
             if not valid_signals:
                 return []
@@ -1297,7 +1377,17 @@ class TradingAnalysisService:
             all_results = []
             ignore_vix = bool(criteria.get("ignore_vix", False))
             allow_intraday_prices = bool(criteria.get("allow_intraday_prices", False))  # resolved above
-            rules_for_scan = effective_config.get("rules") or {}
+            rules_for_scan = dict(effective_config.get("rules") or {})
+            # For STR9/STR18 programs, ensure canonical rules are enforced even if the stored
+            # program config is stale/missing some keys.
+            if effective_program_id in ("str_code_9", "str_code_18"):
+                rules_for_scan.setdefault(
+                    "backtest_filter",
+                    {"min_trades": 10, "min_expectancy": 0.0, "min_profit_factor": 1.2},
+                )
+                rules_for_scan.setdefault("fallback_order", ["VWAP", "Trend", "Momentum"])
+                rules_for_scan["use_canonical_str9"] = True
+            ignore_strategy_enabled = (strategy_source == "program")
             for i, symbol in enumerate(symbols_to_analyze):
                 self.logger.info(f"Analyzing symbol {i+1}/{len(symbols_to_analyze)}: {symbol}")
                 
@@ -1311,6 +1401,7 @@ class TradingAnalysisService:
                     ignore_vix=ignore_vix,
                     rules_config=rules_for_scan,
                     allow_intraday_prices=allow_intraday_prices,
+                    ignore_strategy_enabled=ignore_strategy_enabled,
                 )
                 all_results.extend(results)
             

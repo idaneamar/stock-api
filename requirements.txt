@@ -21,3 +21,4 @@ openpyxl>=3.1.0
 backoff>=2.2.1
 tqdm>=4.65.0
 openai>=1.0.0
+apscheduler>=3.10.0

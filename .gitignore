@@ -39,6 +39,10 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 
+# Local script logs
+*.logs
+prefetch_options_datasp.logs
+
 # Unit test / coverage reports
 htmlcov/
 .tox/
@@ -203,6 +207,13 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# OptionSys local caches (can be huge)
+options/historical_data_cache/
+options/options_data_cache/
+
+# OptionSys generated symbol lists / recommendation files
+options/*.csv
 
 # Marimo
 marimo/_static/
