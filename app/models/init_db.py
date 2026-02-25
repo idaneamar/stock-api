@@ -420,6 +420,74 @@ def create_tables():
         except Exception as e:
             logging.warning(f"Could not seed STR CODE 18 program: {e}")
 
+        # Amar Code 9 – three-strategy system (Trend / Momentum / VWAP).
+        # Key differences from STR CODE 18:
+        #   • VIX filter fully removed; market regime determined by SPY vs EMA200 only.
+        #   • Volume spike (volume > 2× 20-day avg) and ADX > 30 enforced inside
+        #     each strategy's pre-filters (not as a global rule).
+        #   • Momentum strategy is BUY-only (no short trades).
+        #   • Fallback strategy order: VWAP → Trend → Momentum.
+        #   • Risk/reward floor: 2.0.
+        _AMAR9_CONFIG = {
+            "enabled_strategy_names": ["Trend", "Momentum", "VWAP"],
+            "rules": {
+                "strict_rules": True,
+                "volume_spike_required": False,
+                "backtest_filter": {
+                    "min_trades": 10,
+                    "min_expectancy": 0.0,
+                    "min_profit_factor": 1.2,
+                },
+                "fallback_order": ["VWAP", "Trend", "Momentum"],
+            },
+            "market": {
+                "use_vix_filter": False,
+                "spy_ema200_regime": True,
+            },
+            "risk": {
+                "daily_loss_limit_pct": 0.02,
+                "max_daily_investment": 350000,
+                "risk_per_trade": 0.015,
+                "min_risk_reward": 2.0,
+            },
+        }
+
+        try:
+            db = SessionLocal()
+            try:
+                amar9 = db.query(Program).filter(Program.program_id == "amar_code_9").first()
+                if amar9 is None:
+                    amar9 = Program(
+                        program_id="amar_code_9",
+                        name="Amar Code 9",
+                        is_baseline=False,
+                        config=_AMAR9_CONFIG,
+                    )
+                    db.add(amar9)
+                    db.commit()
+                    logging.info("Seeded Amar Code 9 program.")
+                else:
+                    # Sync config to keep thresholds current.
+                    existing_rules = (amar9.config or {}).get("rules", {})
+                    existing_market = (amar9.config or {}).get("market", {})
+                    needs_update = (
+                        existing_rules.get("backtest_filter") != _AMAR9_CONFIG["rules"]["backtest_filter"]
+                        or existing_rules.get("fallback_order") != _AMAR9_CONFIG["rules"]["fallback_order"]
+                        or existing_market.get("use_vix_filter") is not False
+                    )
+                    if needs_update:
+                        updated = dict(amar9.config or {})
+                        updated["rules"] = _AMAR9_CONFIG["rules"]
+                        updated["market"] = _AMAR9_CONFIG["market"]
+                        updated["risk"] = _AMAR9_CONFIG["risk"]
+                        amar9.config = updated
+                        db.commit()
+                        logging.info("Updated Amar Code 9 config.")
+            finally:
+                db.close()
+        except Exception as e:
+            logging.warning(f"Could not seed Amar Code 9 program: {e}")
+
         logging.info("Database tables created successfully")
     except Exception as e:
         logging.error(f"Error creating database tables: {e}")
