@@ -415,7 +415,7 @@ def _process_long_to_standard(df: pd.DataFrame, ticker: str, run_date: str) -> p
     df = df.copy()
     df["__ticker"] = ticker
     df["__run_date"] = run_date
-    df["type"] = df["right"].map({"C": "call", "P": "put"})
+    df["type"] = df["right"].str.upper().map({"C": "call", "P": "put", "CALL": "call", "PUT": "put"})
     df["implied_volatility"] = df["implied_vol"]
     df["exp_date"] = df["expiration"]
     return df[["__ticker", "__run_date", "type", "strike", "bid", "ask", "delta", "implied_volatility", "exp_date"]]
