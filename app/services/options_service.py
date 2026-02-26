@@ -44,7 +44,7 @@ SCRIPTS_DIR = str(Path(__file__).resolve().parents[2] / "options")
 
 OPTIONSYS_DATA_DIR = os.environ.get(
     "STOCK_BASE_DIR",
-    SCRIPTS_DIR,  # default: same folder as scripts if env var not set
+    "/Volumes/Extreme Pro/OptionSys",  # default data directory on this machine
 )
 
 RECS_DIR            = os.path.join(OPTIONSYS_DATA_DIR, "options_recommendations")
