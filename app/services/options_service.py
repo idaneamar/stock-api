@@ -65,6 +65,7 @@ _SCRIPT_LABELS: Dict[str, str] = {
     "fetch_sp500_symbols.py":   "Fetch S&P 500 Symbols",
     "prefetch_options_datasp.py": "Prefetch Options Data",
     "optsp.py":                 "Generate Recommendations (optsp)",
+    "opsp.py":                  "Generate Recommendations (ThetaData)",
     "exeopt.py":                "Execute Orders (exeopt)",
     "backtest_optsp_system.py": "Backtest",
     "Summary_optsp.py":         "Build Summary Report",
@@ -264,21 +265,53 @@ def _run_script(
 
     try:
         proc = subprocess.Popen(
-            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd,
+            cwd=SCRIPTS_DIR,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # merge stderr into stdout for live display
+            text=True,
         )
         with _PROCS_LOCK:
             _RUNNING_PROCS[script_name] = proc
 
+        # Stream output in a background thread and update the job log live.
+        output_lines: list = []
+        _LIVE_OUTPUT_INTERVAL = 10  # seconds between live log snapshots
+
+        def _stream_output() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                output_lines.append(line.rstrip())
+
+        reader_thread = threading.Thread(target=_stream_output, daemon=True)
+        reader_thread.start()
+
+        deadline = t0 + timeout
         try:
-            stdout_raw, stderr_raw = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout_raw, stderr_raw = proc.communicate()
-            raise subprocess.TimeoutExpired(cmd, timeout)
+            while True:
+                elapsed = time.monotonic() - t0
+                if elapsed >= timeout:
+                    proc.kill()
+                    reader_thread.join(timeout=5)
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                # Check every second whether the process has finished.
+                try:
+                    proc.wait(timeout=1)
+                    break  # process exited
+                except subprocess.TimeoutExpired:
+                    pass
+                # Periodically flush live output to the job log entry.
+                if int(elapsed) % _LIVE_OUTPUT_INTERVAL == 0 and output_lines:
+                    live_tail = "\n".join(output_lines[-100:])
+                    running_entry["stdout_tail"] = live_tail[-3000:]
+                    _save_job_logs()
         finally:
+            reader_thread.join(timeout=10)
             with _PROCS_LOCK:
                 _RUNNING_PROCS.pop(script_name, None)
 
+        stdout_raw = "\n".join(output_lines)
         duration_s = round(time.monotonic() - t0, 1)
         cancelled = proc.returncode == -9  # SIGKILL
         ok = proc.returncode == 0
@@ -291,7 +324,7 @@ def _run_script(
             logger.error(f"[job] FAIL   {label}  rc={proc.returncode}  ({duration_s}s)")
 
         stdout_tail = stdout_raw[-3000:] if stdout_raw else ""
-        stderr_tail = stderr_raw[-1500:] if stderr_raw else ""
+        stderr_tail = ""  # merged into stdout
 
         summary = _parse_script_summary(script_name, stdout_tail, stderr_tail)
         if cancelled:
@@ -374,7 +407,7 @@ def _parse_script_summary(script_name: str, stdout: str, stderr: str) -> str:
             if any(k in line.lower() for k in ["done", "complete", "skipped", "fetched", "saved", "error", "total"]):
                 return line[:200]
 
-    elif script_name == "optsp.py":
+    elif script_name in ("optsp.py", "opsp.py"):
         for line in reversed(lines):
             if "saved" in line.lower() or "recommendation" in line.lower() or "returned" in line.lower():
                 return line[:200]
@@ -468,50 +501,37 @@ def run_fetch_sp500() -> Dict[str, Any]:
     return result
 
 
-def run_prefetch(years: Optional[List[int]] = None, workers: int = 4) -> Dict[str, Any]:
+def run_prefetch(years: Optional[List[int]] = None) -> Dict[str, Any]:
+    """Run prefetch_options_datasp.py (ThetaData Terminal) for the given years."""
     if not years:
         years = [date.today().year]
-    args = ["--years"] + [str(y) for y in years] + ["--workers", str(workers)]
+    args = ["--years"] + [str(y) for y in years]
     return _run_script("prefetch_options_datasp.py", extra_args=args, timeout=7200)
 
 
 def run_optsp(
     run_date: Optional[str] = None,
-    cache_only: bool = True,
     *,
     job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Run optsp.py to generate iron condor recommendations.
-
-    cache_only=True (default): use only the locally prefetched data.
-    optsp.py bails out at startup if EODHD_API_TOKEN is unset, even in
-    cache mode.  We pass a placeholder so it proceeds past that check;
-    the actual API is only called when a cache file is missing — which
-    just causes that ticker to be skipped gracefully.
+    Run opsp.py (ThetaData Terminal) to generate iron condor recommendations.
+    Connects to ThetaData Terminal at 127.0.0.1:25510. No API rate limits.
     """
-    args: List[str] = ["--use-cache"]
+    args: List[str] = []
     if run_date:
         args += ["--run-date", run_date]
-
-    extra_env: Dict[str, str] = {}
-    if cache_only:
-        extra_env["OPTSP_WRITE_CACHE"] = "0"
-
-    # If no real token is available, supply a placeholder so optsp passes its
-    # startup token-presence check and proceeds to read from the local cache.
-    # Tickers without a cache file will be skipped (no live API call succeeds).
-    real_token = os.environ.get("EODHD_API_TOKEN") or os.environ.get("EODHD_API_KEY")
-    if not real_token:
-        extra_env.setdefault("EODHD_API_TOKEN", "cache-only-placeholder")
-
-    return _run_script("optsp.py", extra_args=args, extra_env=extra_env, timeout=1800, job_id=job_id)
+    return _run_script("opsp.py", extra_args=args, timeout=1800, job_id=job_id)
 
 
 def run_exeopt(
     rec_date: Optional[str] = None,
     dry_run: bool = False,
     tickers: Optional[List[str]] = None,
+    port: int = 7497,
+    client_id: int = 1,
+    stop_loss_pct: float = 1.0,
+    take_profit_pct: float = 0.50,
 ) -> Dict[str, Any]:
     args: List[str] = []
     if rec_date:
@@ -531,6 +551,12 @@ def run_exeopt(
         args += ["--dry-run"]
     if tickers:
         args += ["--tickers"] + tickers
+    # IBKR connection settings
+    args += ["--port", str(port)]
+    args += ["--client-id", str(client_id)]
+    # Risk management
+    args += ["--stop-loss-pct", str(stop_loss_pct)]
+    args += ["--take-profit-pct", str(take_profit_pct)]
     return _run_script("exeopt.py", extra_args=args, timeout=300)
 
 
