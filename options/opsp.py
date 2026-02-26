@@ -354,7 +354,7 @@ def _fetch_chain_bulk_http(root: str, run_date_obj: date, target_dte: int, dte_t
     spot: Optional[float] = None
     price_df = load_price_df_cached(root)
     if price_df is not None and not price_df.empty:
-        spot = _get_spot_price(price_df, run_date_obj)
+        spot = get_close_on_date(price_df, run_date_obj.isoformat())
 
     # 3. For each target expiration, fetch quote snapshot (bid/ask for all contracts)
     rows = []
