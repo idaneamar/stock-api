@@ -22,3 +22,5 @@ backoff>=2.2.1
 tqdm>=4.65.0
 openai>=1.0.0
 apscheduler>=3.10.0
+# IBKR integration — required by options/exeopt.py for order execution
+ib_insync>=0.9.86

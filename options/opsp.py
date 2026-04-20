@@ -5,7 +5,7 @@ optsptheta.py — Iron Condor recommender (ThetaData edition)
 Identical analysis logic to optsp.py; differs only in the data source:
 - Uses ThetaData v3 Terminal (local HTTP) instead of EODHD UnicornBay API.
 - Cache written to options_data_cache/thetadata/snapshots/ (vs unicornbay/options_eod/).
-- Max 10 recommendations per day (Top 10 by score across ALL tickers).
+- Max recommendations per day configurable 10–100 (default 40; Top N by score across ALL tickers).
 
 Dependencies:
   pip install pandas numpy scipy openpyxl pyarrow thetadata
@@ -75,8 +75,8 @@ MIN_MID = 0.03
 ACCOUNT_SIZE_USD = 250_000.0
 RISK_PER_TRADE_PCT = 0.0075
 
-# Daily output cap
-DAILY_MAX_RECS_HARDCAP = 10  
+# Daily output cap (user setting allowed 10–100; default 40)
+DAILY_MAX_RECS_HARDCAP = 100  
 
 # Candidate limits
 MAX_CANDIDATES_PER_TICKER = 10   
@@ -111,10 +111,18 @@ def previous_business_day(d: date) -> date:
         dd -= timedelta(days=1)
     return dd
 
+
+def is_trading_day(d: date) -> bool:
+    """True if weekday (Mon–Fri); market closed on weekend."""
+    return d.weekday() < 5
+
+
 def determine_run_date() -> str:
+    """Use today if it's a trading day, else previous business day (e.g. weekend)."""
     today = datetime.now().date()
-    d = previous_business_day(today)
-    return d.isoformat()
+    if is_trading_day(today):
+        return today.isoformat()
+    return previous_business_day(today).isoformat()
 
 def _read_tickers_from_csv(path: str) -> List[str]:
     if not os.path.exists(path):
@@ -251,26 +259,58 @@ def _market_filter_ok(run_date: str, vix_max: float, spy_ma_days: int) -> Tuple[
 
 
 # =========================
-# ThetaData Integration
+# ThetaData Integration (options/Greeks only; live stock price from EODHD)
 # =========================
 
 _THETA_HOST = "127.0.0.1"
 _THETA_PORT = int(os.environ.get("THETA_PORT", "25503"))
 
+# EODHD for live underlying price (avoids ThetaData v3 stock snapshot 403)
+EODHD_API_TOKEN = os.environ.get("EODHD_API_TOKEN") or os.environ.get("EODHD_API_KEY") or ""
+
+
+def fetch_eodhd_live_price(symbol: str) -> Optional[float]:
+    """Fetch live underlying price from EODHD real-time API. Returns 'close' or 'price' from JSON."""
+    if not EODHD_API_TOKEN:
+        return None
+    symbol = symbol.upper().strip()
+    candidates = [symbol] if "." in symbol else [symbol, f"{symbol}.US"]
+    for sym in candidates:
+        try:
+            url = f"https://eodhd.com/api/real-time/{sym}?api_token={EODHD_API_TOKEN}&fmt=json"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if not isinstance(data, dict):
+                continue
+            for key in ("close", "price", "last"):
+                val = data.get(key)
+                if val is not None:
+                    try:
+                        p = float(val)
+                        if p > 0:
+                            return p
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            continue
+    return None
+
 
 def _wait_for_theta_ready(timeout: int = 60, poll_interval: float = 2.0) -> None:
     """Poll ThetaTerminal until it is connected to ThetaData's servers.
 
-    The terminal's HTTP server on :25510 starts before it authenticates to
+    The terminal's HTTP server on :25503 starts before it authenticates to
     the backend, so requests made too early return 474. We probe a lightweight
-    endpoint (/v2/list/roots) and wait until it returns a 200 with data.
+    endpoint (/v3/option/list/expirations) and wait until it returns a 200 with data.
     """
     base = f"http://{_THETA_HOST}:{_THETA_PORT}"
     deadline = time.time() + timeout
     logging.info("Waiting for ThetaTerminal to connect to ThetaData servers...")
     while time.time() < deadline:
         try:
-            # Use v3 expirations endpoint as readiness probe.
+            # v3 standard: /v3/option/list/expirations?symbol=
             resp = requests.get(f"{base}/v3/option/list/expirations",
                                 params={"symbol": "AAPL", "format": "json"}, timeout=5)
             if resp.status_code == 200:
@@ -285,6 +325,58 @@ def _wait_for_theta_ready(timeout: int = 60, poll_interval: float = 2.0) -> None
 
 
 _RISK_FREE_RATE = 0.045  # approximate current risk-free rate
+
+
+def _fetch_live_underlying_http(root: str, exp_str: str) -> Optional[float]:
+    """Get live underlying price: EODHD first, then ThetaData v3 option/greeks/bulk_snapshot fallback."""
+    root_upper = root.upper()
+
+    # 1) Prioritize EODHD for live stock price (avoids ThetaData v3 403)
+    price = fetch_eodhd_live_price(root_upper)
+    if price is not None and price > 0:
+        return price
+
+    if not EODHD_API_TOKEN:
+        logging.error(
+            "ERROR: EODHD API Token missing or request failed. Live stock price unavailable. "
+            "Set EODHD_API_TOKEN (or EODHD_API_KEY) for live underlying; options/Greeks still use ThetaData."
+        )
+    else:
+        logging.warning(
+            "EODHD live price request failed for %s. Live stock price unavailable.",
+            root_upper,
+        )
+
+    # 2) Optional: ThetaData v3 bulk_snapshot (tick[12]) for live underlying
+    base = f"http://{_THETA_HOST}:{_THETA_PORT}"
+    try:
+        resp = requests.get(
+            f"{base}/v3/option/greeks/bulk_snapshot",
+            params={"root": root_upper, "symbol": root_upper, "exp": exp_str},
+            timeout=15,
+        )
+        if resp.status_code == 410:
+            logging.debug("ThetaData bulk_snapshot returned 410 Gone; not used for live price.")
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        contracts = data.get("response", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        for obj in contracts:
+            ticks = obj.get("ticks", [])
+            if not ticks:
+                continue
+            tick = ticks[0]
+            if len(tick) > 12:
+                raw = tick[12]
+                if raw is not None and raw != "":
+                    try:
+                        return float(raw)
+                    except (TypeError, ValueError):
+                        pass
+            break
+    except Exception as e:
+        logging.debug("ThetaData v3 live underlying fetch failed for %s: %s", root_upper, e)
+    return None
 
 
 def _bs_price(S: float, K: float, T: float, r: float, sigma: float, right: str) -> float:
@@ -329,7 +421,7 @@ def _fetch_chain_bulk_http(root: str, run_date_obj: date, target_dte: int, dte_t
     """
     base = f"http://{_THETA_HOST}:{_THETA_PORT}"
 
-    # 1. Get expirations (v3 format: symbol param, YYYY-MM-DD dates in response)
+    # 1. Get expirations (v3 standard: /v3/option/list/expirations?symbol=)
     resp = requests.get(f"{base}/v3/option/list/expirations",
                         params={"symbol": root.upper(), "format": "json"}, timeout=10)
     resp.raise_for_status()
@@ -350,11 +442,18 @@ def _fetch_chain_bulk_http(root: str, run_date_obj: date, target_dte: int, dte_t
     if not target_exps:
         return pd.DataFrame()
 
-    # 2. Get underlying price for Black-Scholes computations
+    # 2. Get underlying price: live from v3 option/greeks/bulk_snapshot when run_date is today, else cache
     spot: Optional[float] = None
-    price_df = load_price_df_cached(root)
-    if price_df is not None and not price_df.empty:
-        spot = get_close_on_date(price_df, run_date_obj.isoformat())
+    live_underlying: Optional[float] = None
+    today = datetime.now().date()
+    if run_date_obj == today:
+        live_underlying = _fetch_live_underlying_http(root, target_exps[0].strftime("%Y%m%d"))
+        if live_underlying is not None and live_underlying > 0:
+            spot = live_underlying
+    if spot is None:
+        price_df = load_price_df_cached(root)
+        if price_df is not None and not price_df.empty:
+            spot = get_close_on_date(price_df, run_date_obj.isoformat())
 
     # 3. For each target expiration, fetch quote snapshot (bid/ask for all contracts)
     rows = []
@@ -393,7 +492,7 @@ def _fetch_chain_bulk_http(root: str, run_date_obj: date, target_dte: int, dte_t
                     sigma = iv if iv else 0.30  # fallback sigma for delta estimate
                     delta = _bs_delta(spot, strike, T, _RISK_FREE_RATE, sigma, r_flag)
 
-                rows.append({
+                row = {
                     "expiration": exp_str,
                     "strike": strike,
                     "right": right,
@@ -401,7 +500,10 @@ def _fetch_chain_bulk_http(root: str, run_date_obj: date, target_dte: int, dte_t
                     "ask": ask,
                     "delta": delta,
                     "implied_vol": iv if iv else float("nan"),
-                })
+                }
+                if live_underlying is not None:
+                    row["__underlying_price"] = live_underlying
+                rows.append(row)
         except Exception as e:
             logging.warning(f"Quote snapshot failed for {root} exp={exp_str}: {e}")
 
@@ -418,7 +520,10 @@ def _process_long_to_standard(df: pd.DataFrame, ticker: str, run_date: str) -> p
     df["type"] = df["right"].str.upper().map({"C": "call", "P": "put", "CALL": "call", "PUT": "put"})
     df["implied_volatility"] = df["implied_vol"]
     df["exp_date"] = df["expiration"]
-    return df[["__ticker", "__run_date", "type", "strike", "bid", "ask", "delta", "implied_volatility", "exp_date"]]
+    out_cols = ["__ticker", "__run_date", "type", "strike", "bid", "ask", "delta", "implied_volatility", "exp_date"]
+    if "__underlying_price" in df.columns:
+        out_cols.append("__underlying_price")
+    return df[out_cols]
 
 
 def fetch_chain_for_ticker(
@@ -692,10 +797,16 @@ def pick_iron_condors(
 
     widths = list(range(int(WIDTH_BOUNDS[0]), int(WIDTH_BOUNDS[1]) + 1))
 
+    # Prefer live underlying from chain (v3 bulk_snapshot) over historical cache
     spot = None
-    price_df = load_price_df_cached(ticker)
-    if price_df is not None:
-        spot = get_close_on_date(price_df, run_date)
+    if "__underlying_price" in df.columns:
+        u = df["__underlying_price"].dropna()
+        if not u.empty:
+            spot = float(u.iloc[0])
+    if spot is None:
+        price_df = load_price_df_cached(ticker)
+        if price_df is not None:
+            spot = get_close_on_date(price_df, run_date)
 
     dte = int((pd.to_datetime(best_exp) - pd.to_datetime(run_date)).days)
     iv_est = _estimate_chain_iv_atm(df, spot, best_exp) if spot is not None else None
@@ -718,12 +829,31 @@ def pick_iron_condors(
                     continue
                 lc = lc_rows.iloc[0]
 
+                # Per-leg bid/ask (used for conservative fill estimate)
+                sp_bid = float(pd.to_numeric(sp[c_bid], errors="coerce"))
+                sp_ask = float(pd.to_numeric(sp[c_ask], errors="coerce"))
+                lp_bid = float(pd.to_numeric(lp[c_bid], errors="coerce"))
+                lp_ask = float(pd.to_numeric(lp[c_ask], errors="coerce"))
+                sc_bid = float(pd.to_numeric(sc[c_bid], errors="coerce"))
+                sc_ask = float(pd.to_numeric(sc[c_ask], errors="coerce"))
+                lc_bid = float(pd.to_numeric(lc[c_bid], errors="coerce"))
+                lc_ask = float(pd.to_numeric(lc[c_ask], errors="coerce"))
+
+                # Mid estimate
                 credit = float(sp["_mid"]) - float(lp["_mid"]) + float(sc["_mid"]) - float(lc["_mid"])
-                if credit < float(min_credit):
+
+                # Conservative fill estimate: sell at bid, buy at ask
+                net_credit_conservative = sp_bid - lp_ask + sc_bid - lc_ask
+
+                # Pro-Fill: aggressive fill weighted 75% mid / 25% conservative
+                opti_fill = (credit * 0.75) + (net_credit_conservative * 0.25)
+
+                # Filter and score on opti_fill for realistic evaluation
+                if opti_fill < float(min_credit):
                     continue
 
                 if float(MIN_CREDIT_TO_WIDTH) > 0 and float(w) > 0:
-                    if (float(credit) / float(w)) < float(MIN_CREDIT_TO_WIDTH):
+                    if (opti_fill / float(w)) < float(MIN_CREDIT_TO_WIDTH):
                         continue
 
                 pop_ln = None
@@ -733,11 +863,11 @@ def pick_iron_condors(
                 if pop < float(min_pop):
                     continue
 
-                max_loss = float(w) - float(credit) 
+                max_loss = float(w) - opti_fill
                 if max_loss <= 0:
                     continue
 
-                score = float(pop) * float(credit) / max(float(w), 1e-6)
+                score = float(pop) * opti_fill / max(float(w), 1e-6)
 
                 candidates.append({
                     "ticker": _symbol_base(ticker),
@@ -750,6 +880,13 @@ def pick_iron_condors(
                     "long_call": float(lc[c_strike]),
                     "width": float(w),
                     "net_credit": float(credit),
+                    "net_credit_conservative": float(net_credit_conservative),
+                    "net_credit_opti_fill": float(opti_fill),
+                    "min_recommended_price": float(net_credit_conservative),
+                    "sp_bid": sp_bid, "sp_ask": sp_ask,
+                    "lp_bid": lp_bid, "lp_ask": lp_ask,
+                    "sc_bid": sc_bid, "sc_ask": sc_ask,
+                    "lc_bid": lc_bid, "lc_ask": lc_ask,
                     "max_loss_per_share": float(max_loss),
                     "pop_est": float(pop),
                     "pop_method": "lognormal" if pop_ln is not None else "delta_proxy",
@@ -764,7 +901,7 @@ def pick_iron_condors(
         return pd.DataFrame()
 
     out = pd.DataFrame(candidates)
-    out = out.sort_values(["score", "pop_est", "net_credit"], ascending=[False, False, False]).head(MAX_CANDIDATES_PER_TICKER).reset_index(drop=True)
+    out = out.sort_values(["score", "pop_est", "net_credit_opti_fill"], ascending=[False, False, False]).head(MAX_CANDIDATES_PER_TICKER).reset_index(drop=True)
     return out
 
 
@@ -793,7 +930,7 @@ def main() -> None:
     ap.add_argument("--delta", type=float, default=DELTA_TARGET)
     ap.add_argument("--min-pop", type=float, default=MIN_POP)
     ap.add_argument("--min-credit", type=float, default=MIN_NET_CREDIT)
-    ap.add_argument("--max-trades", type=int, default=10, help="Max recommendations per day")
+    ap.add_argument("--max-trades", type=int, default=40, help="Max recommendations per day (10–100)")
     ap.add_argument("--enable-market-filter", action="store_true", help="Enable SPY/VIX regime filter")
     ap.add_argument("--vix-max", type=float, default=VIX_MAX_DEFAULT)
     ap.add_argument("--spy-ma-days", type=int, default=SPY_MA_DAYS_DEFAULT)
@@ -807,6 +944,13 @@ def main() -> None:
     if not tickers:
         logging.error("No tickers.")
         return
+
+    # Live scanner mode: on a valid trading day, use today and bypass cache for fresh data
+    today_str = datetime.now().date().isoformat()
+    if run_date == today_str and is_trading_day(datetime.now().date()):
+        args.use_cache = False
+        args.write_cache = False
+        logging.info("Live scanner mode: run_date=today, cache disabled (use_cache=False, write_cache=False)")
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -824,7 +968,7 @@ def main() -> None:
 
     all_cands = []
 
-    # ThetaTerminal is expected to already be running on localhost:25510.
+    # ThetaTerminal is expected to already be running on localhost:25503.
     # We do NOT start it here — starting a second instance hangs forever.
     _wait_for_theta_ready(timeout=60, poll_interval=2.0)
 
@@ -864,14 +1008,23 @@ def main() -> None:
         return
 
     df = pd.concat(all_cands, ignore_index=True)
-    df = df.sort_values(["score", "pop_est", "net_credit"], ascending=[False, False, False]).reset_index(drop=True)
+    df = df.sort_values(["score", "pop_est", "net_credit_opti_fill"], ascending=[False, False, False]).reset_index(drop=True)
 
-    max_trades = min(int(args.max_trades), DAILY_MAX_RECS_HARDCAP)
+    max_trades = max(10, min(100, int(args.max_trades)))
+    max_trades = min(max_trades, DAILY_MAX_RECS_HARDCAP)
     df = df.head(max_trades).copy()
 
     df["contracts"] = df["max_loss_per_share"].apply(lambda x: size_contracts(x, float(args.account), float(args.risk_pct)))
     df["max_risk_usd"] = df["max_loss_per_share"] * 100.0 * df["contracts"]
-    df["max_profit_usd"] = df["net_credit"] * 100.0 * df["contracts"]
+    df["max_profit_usd"] = df["net_credit_opti_fill"] * 100.0 * df["contracts"]
+    # Conservative profit estimate uses bid/ask fill prices
+    if "net_credit_conservative" in df.columns:
+        df["max_profit_usd_conservative"] = df["net_credit_conservative"] * 100.0 * df["contracts"]
+
+    # IBKR margin: spread_width (put wing) - net_credit_opti_fill, per contract and total
+    spread_width = df["width"]
+    df["margin_per_contract"] = (spread_width - df["net_credit_opti_fill"]) * 100.0
+    df["total_margin"] = df["margin_per_contract"] * df["contracts"]
 
     out_csv = os.path.join(args.outdir, f"{OUTPUT_PREFIX}_{run_date}.csv")
     df.to_csv(out_csv, index=False)
@@ -882,7 +1035,7 @@ def main() -> None:
 
     logging.info(f"Saved: {out_csv}")
     logging.info(f"Saved: {out_xlsx}")
-    logging.info(f"Returned {len(df)} recommendations (max {DAILY_MAX_RECS_HARDCAP}).")
+    logging.info(f"Returned {len(df)} recommendations (max_trades={max_trades}).")
 
 if __name__ == "__main__":
     main()

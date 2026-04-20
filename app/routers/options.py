@@ -25,14 +25,14 @@ import os
 from datetime import date
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from app.services import options_service as svc
 from app.services.options_scheduler import get_scheduler_jobs
 
 # scripts that can be cancelled
-_CANCELLABLE = {"optsp.py", "prefetch_options_datasp.py", "fetch_sp500_symbols.py"}
+_CANCELLABLE = {"optsp.py", "opsp.py", "prefetch_options_datasp.py", "fetch_sp500_symbols.py"}
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,15 @@ class OptionsRecommendation(BaseModel):
     long_call: Optional[float] = None
     width: Optional[float] = None
     net_credit: Optional[float] = None
+    net_credit_conservative: Optional[float] = None
+    sp_bid: Optional[float] = None
+    sp_ask: Optional[float] = None
+    lp_bid: Optional[float] = None
+    lp_ask: Optional[float] = None
+    sc_bid: Optional[float] = None
+    sc_ask: Optional[float] = None
+    lc_bid: Optional[float] = None
+    lc_ask: Optional[float] = None
     max_loss_per_share: Optional[float] = None
     pop_est: Optional[float] = None
     pop_method: Optional[str] = None
@@ -69,12 +78,30 @@ class OptionsRecommendation(BaseModel):
     contracts: Optional[int] = None
     max_risk_usd: Optional[float] = None
     max_profit_usd: Optional[float] = None
+    max_profit_usd_conservative: Optional[float] = None
+    margin_per_contract: Optional[float] = None
+    total_margin: Optional[float] = None
+    net_credit_opti_fill: Optional[float] = None
+    min_recommended_price: Optional[float] = None
 
 
 class ExecuteRequest(BaseModel):
     tickers: Optional[List[str]] = None
     rec_date: Optional[str] = None
     dry_run: bool = False
+    port: int = 7497
+    client_id: int = 1
+    stop_loss_pct: float = 1.0
+    take_profit_pct: float = 0.50
+
+
+class CreatePendingExecutionRequest(BaseModel):
+    rec_date: Optional[str] = None
+    dry_run: bool = False
+    port: int = 7497
+    client_id: int = 1
+    stop_loss_pct: float = 1.0
+    take_profit_pct: float = 0.50
 
 
 class ExecuteResponse(BaseModel):
@@ -86,12 +113,11 @@ class ExecuteResponse(BaseModel):
 
 class PrefetchRequest(BaseModel):
     years: Optional[List[int]] = None
-    workers: int = 4
 
 
 class RunOptspRequest(BaseModel):
     run_date: Optional[str] = None
-    cache_only: bool = True
+    max_trades: Optional[int] = None  # 10–100; default 40 when omitted
 
 
 class ChatMessage(BaseModel):
@@ -206,6 +232,277 @@ def get_symbols():
 
 
 # ---------------------------------------------------------------------------
+# POST /options/symbols/upload
+# ---------------------------------------------------------------------------
+
+class SymbolsUploadRequest(BaseModel):
+    symbols: List[str]
+
+@router.post("/symbols/upload")
+def upload_symbols(payload: SymbolsUploadRequest):
+    """Replace the stock universe with a custom symbol list.
+    Expects { "symbols": ["AAPL", "MSFT", ...] }.
+    """
+    cleaned = [s.strip().upper() for s in payload.symbols if s.strip()]
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="symbols list is empty after cleaning")
+    try:
+        svc.save_symbols(cleaned)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "count": len(cleaned), "message": f"Saved {len(cleaned)} symbols."}
+
+
+# ---------------------------------------------------------------------------
+# POST /options/symbols/restore_default
+# ---------------------------------------------------------------------------
+
+@router.post("/symbols/restore_default")
+def restore_default_symbols():
+    """Restore the stock universe to the packaged S&P 500 default list."""
+    try:
+        count, sample = svc.restore_default_symbols()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {
+        "ok": True,
+        "count": count,
+        "sample": sample[:10],
+        "message": f"Restored default S&P 500 list ({count} symbols).",
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /options/recommendations/reprice
+# ---------------------------------------------------------------------------
+
+class RepriceRequest(BaseModel):
+    ticker: str
+    expiration: str          # YYYY-MM-DD
+    short_put: float
+    long_put: float
+    short_call: float
+    long_call: float
+    contracts: int = 1
+    width: Optional[float] = None
+    strict_validity: bool = False
+
+
+@router.post("/recommendations/reprice")
+def reprice_recommendation(payload: RepriceRequest):
+    """
+    Fetch fresh quotes for a specific iron-condor set and return updated metrics.
+
+    Returns:
+      spot, per-leg bid/ask/mid, debug (legs, spreads, server_timestamp_utc),
+      validity_severity (valid|caution|not_ideal), validity_reasons,
+      is_valid, response_time_ms
+    """
+    import time as _time
+    start = _time.perf_counter()
+    logger.info("reprice request: ticker=%s strict_validity=%s", payload.ticker, payload.strict_validity)
+    try:
+        result = svc.reprice_iron_condor(
+            ticker=payload.ticker,
+            expiration=payload.expiration,
+            short_put=payload.short_put,
+            long_put=payload.long_put,
+            short_call=payload.short_call,
+            long_call=payload.long_call,
+            contracts=payload.contracts,
+            width=payload.width,
+            strict_validity=payload.strict_validity,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    elapsed_ms = int((_time.perf_counter() - start) * 1000)
+    result["response_time_ms"] = elapsed_ms
+    if "debug" in result and isinstance(result["debug"], dict):
+        result["debug"]["response_time_ms"] = elapsed_ms
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Actual fills — per-user persistence (source of truth on backend)
+# ---------------------------------------------------------------------------
+
+def _user_id_from_request(request: Request, x_user_id: Optional[str] = Header(None, alias="X-User-Id")) -> str:
+    """Resolve user id from X-User-Id header, then username query param, default 'idane'."""
+    if x_user_id and x_user_id.strip():
+        return x_user_id.strip()
+    username = request.query_params.get("username")
+    if username and str(username).strip():
+        return str(username).strip()
+    return "idane"
+
+
+class ActualFillPutBody(BaseModel):
+    rec_key: str
+    ticker: str
+    expiration: str
+    short_put: float
+    long_put: float
+    short_call: float
+    long_call: float
+    actual_net_premium_per_contract: float
+    actual_contracts: Optional[int] = None
+    entry_pop: Optional[float] = None
+    is_entered: Optional[bool] = True
+
+
+def _upsert_actual_fill_payload(
+    payload: ActualFillPutBody,
+    request: Request,
+    x_user_id: Optional[str],
+):
+    user_id = _user_id_from_request(request, x_user_id)
+    try:
+        svc.upsert_actual_fill(
+            user_id=user_id,
+            rec_key=payload.rec_key,
+            ticker=payload.ticker,
+            expiration=payload.expiration,
+            short_put=payload.short_put,
+            long_put=payload.long_put,
+            short_call=payload.short_call,
+            long_call=payload.long_call,
+            actual_net_premium_per_contract=payload.actual_net_premium_per_contract,
+            actual_contracts=payload.actual_contracts,
+            entry_pop=payload.entry_pop,
+            is_entered=payload.is_entered if payload.is_entered is not None else True,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "rec_key": payload.rec_key}
+
+
+@router.put("/actual_fills")
+def put_actual_fill(
+    payload: ActualFillPutBody,
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """UPSERT: insert or overwrite actual fill for (user_id, rec_key)."""
+    return _upsert_actual_fill_payload(payload, request, x_user_id)
+
+
+@router.post("/actual_fills")
+def post_actual_fill(
+    payload: ActualFillPutBody,
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """POST alias for browsers/proxies that block PUT preflight to localhost."""
+    return _upsert_actual_fill_payload(payload, request, x_user_id)
+
+
+@router.get("/actual_fills")
+def get_actual_fills(
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+    date: Optional[str] = None,
+    tickers: Optional[str] = None,
+):
+    """
+    Return all actual fills for the user, keyed by rec_key.
+    User: X-User-Id header, or username query param (default 'idane').
+    Optional: date=YYYY-MM-DD or tickers=AAPL,MSFT to filter.
+    """
+    user_id = _user_id_from_request(request, x_user_id)
+    ticker_list = [t.strip() for t in tickers.split(",")] if tickers else None
+    try:
+        fills = svc.get_actual_fills(user_id=user_id, date_filter=date, tickers=ticker_list)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"fills": fills}
+
+
+@router.delete("/actual_fills/all")
+def delete_all_actual_fills(
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """Delete ALL actual fills for the current user. Resets their active-positions state to empty."""
+    user_id = _user_id_from_request(request, x_user_id)
+    try:
+        count = svc.delete_all_actual_fills(user_id=user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True, "deleted": count, "user_id": user_id}
+
+
+@router.delete("/actual_fills/{rec_key:path}")
+def delete_actual_fill(
+    rec_key: str,
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """Delete the stored actual fill for this user and rec_key."""
+    user_id = _user_id_from_request(request, x_user_id)
+    try:
+        deleted = svc.delete_actual_fill(user_id=user_id, rec_key=rec_key)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Actual fill not found")
+    return {"ok": True, "rec_key": rec_key}
+
+
+class ManualExitBody(BaseModel):
+    exit_price: float
+    exit_date: str  # YYYY-MM-DD
+    username: Optional[str] = None
+    is_active: Optional[bool] = False
+
+
+@router.post("/actual_fills/{rec_key:path}/exit")
+def manual_exit_position(
+    rec_key: str,
+    body: ManualExitBody,
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """
+    Manually close a position: set is_active=false, save exit_price and exit_date.
+    User: X-User-Id header, username in body, or username query param (default 'idane').
+    """
+    user_id = (body.username and body.username.strip()) or _user_id_from_request(request, x_user_id)
+    try:
+        updated = svc.set_actual_fill_exit(
+            user_id=user_id,
+            rec_key=rec_key,
+            exit_price=body.exit_price,
+            exit_date=body.exit_date,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Position not found or already exited")
+    return {"ok": True, "rec_key": rec_key, "message": "Position closed"}
+
+
+# ---------------------------------------------------------------------------
+# GET /options/active-positions
+# ---------------------------------------------------------------------------
+
+@router.get("/active-positions")
+def get_active_positions(
+    request: Request,
+    x_user_id: Optional[str] = Header(None, alias="X-User-Id"),
+):
+    """
+    Return active positions (is_entered=1, is_active=1) with live P&L, updated POP, pop_warning.
+    User: X-User-Id header or username query param (default 'idane').
+    """
+    user_id = _user_id_from_request(request, x_user_id)
+    try:
+        positions = svc.get_active_positions_with_stats(user_id=user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"active_positions": positions}
+
+
+# ---------------------------------------------------------------------------
 # GET /options/status
 # ---------------------------------------------------------------------------
 
@@ -232,6 +529,26 @@ def get_job_logs(limit: int = 50):
       stdout_tail, stderr_tail, summary
     """
     return {"logs": svc.get_job_logs(limit=limit), "count": limit}
+
+
+# ---------------------------------------------------------------------------
+# GET /options/job-logs/download — download logs as JSON file
+# ---------------------------------------------------------------------------
+
+@router.get("/job-logs/download")
+def download_job_logs(limit: int = 500):
+    """
+    Return job logs as a downloadable JSON file for debugging.
+    Use for uploading elsewhere (e.g. support) to diagnose issues.
+    """
+    from fastapi.responses import JSONResponse
+    logs = svc.get_job_logs(limit=limit)
+    return JSONResponse(
+        content={"logs": logs, "count": len(logs)},
+        headers={
+            "Content-Disposition": 'attachment; filename="options_job_logs.json"',
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +642,44 @@ def get_ticker_history(
 
 
 # ---------------------------------------------------------------------------
+# GET /options/ibkr-ping
+# ---------------------------------------------------------------------------
+
+@router.get("/ibkr-ping")
+def ibkr_ping(port: int = 7497, client_id: int = 1):
+    """
+    Test the IBKR connection without loading recommendations or placing orders.
+    Connects to TWS/Gateway, retrieves managed accounts, then disconnects.
+
+    Returns:
+      ok            – true if connection succeeded and accounts were found
+      accounts      – list of managed account IDs (e.g. ["DU12345"])
+      stdout        – full exeopt log (useful for diagnosing failures)
+      duration_s    – how long the test took
+    """
+    result = svc.run_ibkr_ping(port=port, client_id=client_id)
+    # Parse the account list from stdout if present
+    accounts: list = []
+    for line in result.get("stdout", "").splitlines():
+        if "Connected to IBKR — accounts:" in line:
+            try:
+                raw = line.split("accounts:")[1].strip()
+                # raw looks like "['DU12345', 'DU99999']"
+                import ast
+                accounts = ast.literal_eval(raw)
+            except Exception:
+                pass
+    return {
+        "ok": result["ok"],
+        "accounts": accounts,
+        "stdout": result.get("stdout", ""),
+        "duration_s": result.get("duration_s"),
+        "port": port,
+        "client_id": client_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /options/execute
 # ---------------------------------------------------------------------------
 
@@ -338,13 +693,81 @@ def execute_recommendations(req: ExecuteRequest, background_tasks: BackgroundTas
         rec_date=req.rec_date,
         dry_run=req.dry_run,
         tickers=req.tickers,
+        port=req.port,
+        client_id=req.client_id,
+        stop_loss_pct=req.stop_loss_pct,
+        take_profit_pct=req.take_profit_pct,
     )
     return ExecuteResponse(
         ok=result["ok"],
         message="Execution completed" if result["ok"] else "Execution failed",
         returncode=result["returncode"],
-        details=(result["stdout"] + "\n" + result["stderr"]).strip()[-2000:],
+        details=f"STDOUT:\n{result['stdout']}\nSTDERR:\n{result['stderr']}",
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /options/pending-execution   — create 5-min countdown job
+# GET  /options/pending-execution   — poll status + remaining seconds
+# POST /options/pending-execution/confirm — execute immediately
+# POST /options/pending-execution/cancel  — cancel
+# ---------------------------------------------------------------------------
+
+@router.post("/pending-execution")
+async def create_pending_execution(req: CreatePendingExecutionRequest):
+    """
+    Create a pending execution job with a 5-minute countdown (manual use only).
+    Do NOT call this after generating recommendations — the app does not
+    auto-send to IBKR; the user sends manually via Execute / Send to IBKR.
+    """
+    from app.services import pending_execution as pe
+
+    rec_date = req.rec_date or date.today().isoformat()
+    job = await pe.create_pending_job(
+        rec_date=rec_date,
+        config={
+            "dry_run": req.dry_run,
+            "port": req.port,
+            "client_id": req.client_id,
+            "stop_loss_pct": req.stop_loss_pct,
+            "take_profit_pct": req.take_profit_pct,
+        },
+    )
+    return job.to_dict()
+
+
+@router.get("/pending-execution")
+async def get_pending_execution():
+    """
+    Poll the current pending execution job status.
+    Returns {"status": "none"} if no active job.
+    """
+    from app.services import pending_execution as pe
+
+    job = pe.get_current_job()
+    if not job:
+        return {"status": "none"}
+    return job.to_dict()
+
+
+@router.post("/pending-execution/confirm")
+async def confirm_pending_execution(job_id: str):
+    """Execute the pending job immediately (user tapped 'Send Now')."""
+    from app.services import pending_execution as pe
+
+    job = await pe.confirm_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="No matching pending job found")
+    return job.to_dict()
+
+
+@router.post("/pending-execution/cancel")
+async def cancel_pending_execution(job_id: Optional[str] = None):
+    """Cancel the pending job (user tapped 'Cancel')."""
+    from app.services import pending_execution as pe
+
+    cancelled = await pe.cancel_job(job_id)
+    return {"cancelled": cancelled}
 
 
 # ---------------------------------------------------------------------------
@@ -601,23 +1024,44 @@ def _bg_fetch_symbols() -> None:
 
 
 # ---------------------------------------------------------------------------
-# POST /options/trigger/prefetch
+# POST /options/trigger/prefetch  (Sync Data: cache check + prefetch only)
 # ---------------------------------------------------------------------------
 
 @router.post("/trigger/prefetch")
 def trigger_prefetch(req: PrefetchRequest, background_tasks: BackgroundTasks):
-    """Manually trigger prefetch_options_datasp.py for given years (runs in background)."""
-    years = req.years or [date.today().year]
-    background_tasks.add_task(_bg_prefetch, years, req.workers)
-    return {"message": f"prefetch started in background for years {years}"}
+    """
+    Sync Data only: check today's cache, prefetch missing symbols (v3), then
+    optional full prefetch for years. Does NOT run optsp or generate recommendations.
+    Runs in background; poll GET /options/status or morning status for completion.
+    """
+    years = req.years  # None or e.g. [2024, 2025] for full prefetch after sync
+    background_tasks.add_task(_bg_sync_data, years)
+    return {
+        "ok": True,
+        "message": (
+            "Sync started: checking cache, prefetching missing today. "
+            "Check Activity or status for completion."
+        ),
+        "years": years,
+    }
 
 
-def _bg_prefetch(years: List[int], workers: int) -> None:
-    result = svc.run_prefetch(years=years, workers=workers)
+def _bg_sync_data(years: Optional[List[int]]) -> None:
+    """Background: prefetch today if missing, optionally prefetch years. Only calls run_sync_data (no optsp)."""
+    try:
+        svc.run_sync_data(years=years)
+        logger.info("[trigger] Sync data completed")
+    except Exception as e:
+        logger.exception("[trigger] Sync data failed: %s", e)
+
+
+def _bg_prefetch(years: List[int]) -> None:
+    """Legacy: prefetch only (no cache check, no optsp). Use _bg_sync_data for full sync."""
+    result = svc.run_prefetch(years=years)
     if result["ok"]:
-        logger.info(f"[trigger] prefetch OK for {years}")
+        logger.info(f"[trigger] ThetaData prefetch OK for {years}")
     else:
-        logger.error(f"[trigger] prefetch FAILED: {result['stderr'][-500:]}")
+        logger.error(f"[trigger] ThetaData prefetch FAILED: {result['stderr'][-500:]}")
 
 
 # ---------------------------------------------------------------------------
@@ -626,33 +1070,30 @@ def _bg_prefetch(years: List[int], workers: int) -> None:
 
 @router.post("/trigger/run-optsp")
 def trigger_run_optsp(req: RunOptspRequest, background_tasks: BackgroundTasks):
-    """Manually trigger optsp.py for a specific date (runs in background)."""
-    # Always use today as the trade date so the output file is iron_condor_{today}.csv.
-    # optsp's fetch_chain_for_ticker will fall back to the most recent available EOD
-    # cache if today's data hasn't been downloaded yet (e.g. before market close).
+    """Manually trigger opsp.py (ThetaData) for a specific date (runs in background)."""
     run_date = req.run_date or date.today().isoformat()
-    # If already running, don't start a second copy.
-    if svc.is_script_running("optsp.py"):
+    max_trades = req.max_trades  # 10–100; None = use script default (40)
+    if svc.is_script_running("opsp.py"):
         return {
             "ok": False,
             "already_running": True,
-            "message": "optsp is already running",
+            "message": "opsp.py is already running",
             "run_date": run_date,
         }
 
-    job_id = f"optsp.py-{run_date}-{os.getpid()}"
-    background_tasks.add_task(_bg_run_optsp, run_date, req.cache_only, job_id)
+    job_id = f"opsp.py-{run_date}-{os.getpid()}"
+    background_tasks.add_task(_bg_run_optsp, run_date, job_id, max_trades)
     return {
         "ok": True,
         "already_running": False,
         "job_id": job_id,
         "run_date": run_date,
-        "message": f"optsp started in background for date {run_date}",
+        "message": f"opsp.py started in background for date {run_date}",
     }
 
 
-def _bg_run_optsp(run_date: str, cache_only: bool, job_id: str) -> None:
-    # If symbols are missing, fetch them first so optsp has a universe.
+def _bg_run_optsp(run_date: str, job_id: str, max_trades: Optional[int] = None) -> None:
+    # If symbols are missing, fetch them first so opsp has a universe.
     try:
         symbols = svc.get_symbols()
         if not symbols:
@@ -661,8 +1102,8 @@ def _bg_run_optsp(run_date: str, cache_only: bool, job_id: str) -> None:
     except Exception as exc:
         logger.warning(f"[trigger] fetch_sp500_symbols pre-step failed: {exc}")
 
-    result = svc.run_optsp(run_date=run_date, cache_only=cache_only, job_id=job_id)
+    result = svc.run_optsp(run_date=run_date, job_id=job_id, max_trades=max_trades)
     if result["ok"]:
-        logger.info(f"[trigger] optsp OK for {run_date}")
+        logger.info(f"[trigger] opsp.py OK for {run_date}")
     else:
-        logger.error(f"[trigger] optsp FAILED: {result['stderr'][-500:]}")
+        logger.error(f"[trigger] opsp.py FAILED: {result['stderr'][-500:]}")

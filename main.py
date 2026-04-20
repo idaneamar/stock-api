@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings as config_settings
 from app.schemas.response import ErrorResponse
 from app.models.init_db import create_tables
-from app.routers import scans, analysis, websocket, settings, trades, strategies, programs, ai, options as options_router
+from app.routers import scans, analysis, websocket, settings, trades, strategies, programs, ai, options as options_router, ibkr as ibkr_router
 from app.services.options_scheduler import start_options_scheduler, stop_options_scheduler
 from app.services.options_service import warm_ticker_summaries_cache
 
@@ -95,7 +95,17 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Access-Control-Allow-Private-Network"],
 )
+
+
+@app.middleware("http")
+async def allow_private_network_preflight(request, call_next):
+    """Allow Chrome Private Network Access preflight for localhost targets."""
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 # -----------------------------
 # Simple endpoints
@@ -138,6 +148,7 @@ app.include_router(programs.router)
 app.include_router(trades.router)
 app.include_router(ai.router)
 app.include_router(options_router.router)
+app.include_router(ibkr_router.router, prefix="/options")
 
 # -----------------------------
 # Exception handlers

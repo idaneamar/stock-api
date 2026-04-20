@@ -22,7 +22,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,6 +35,112 @@ import pandas as pd
 import pytz
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Live-price in-memory cache (per ticker, 60 s TTL)
+# Prevents EODHD rate-limiting when many cards poll /reprice simultaneously.
+# ---------------------------------------------------------------------------
+_spot_cache: Dict[str, Tuple[float, float]] = {}  # {TICKER: (price, monotonic_ts)}
+_spot_cache_lock = threading.Lock()
+_SPOT_CACHE_TTL = 60.0  # seconds
+
+
+def _get_live_spot_cached(ticker: str) -> Optional[float]:
+    """Return the cached live price for *ticker* if it is still fresh."""
+    key = ticker.upper()
+    with _spot_cache_lock:
+        entry = _spot_cache.get(key)
+        if entry and (time.monotonic() - entry[1]) < _SPOT_CACHE_TTL:
+            return entry[0]
+    return None
+
+
+def _set_live_spot_cached(ticker: str, price: float) -> None:
+    key = ticker.upper()
+    with _spot_cache_lock:
+        _spot_cache[key] = (price, time.monotonic())
+
+
+# ---------------------------------------------------------------------------
+# Option-chain in-memory cache (per ticker+date, 45 s TTL)
+# Each reprice used to fetch the full chain from ThetaTerminal on every poll
+# (use_cache=False).  With N cards polling every 4 s that is N×2-3 HTTP calls
+# per poll cycle.  Caching the chain here cuts that down to ~1 call per ticker
+# per 45 s while still delivering fresh bid/ask data during live trading hours.
+# ---------------------------------------------------------------------------
+_chain_cache: Dict[str, Tuple[Any, float]] = {}   # {"TICKER:YYYY-MM-DD": (DataFrame, ts)}
+_chain_cache_lock = threading.Lock()
+_CHAIN_CACHE_TTL = 45.0  # seconds
+
+
+def _get_chain_cached(ticker: str, run_date: str):
+    key = f"{ticker.upper()}:{run_date}"
+    with _chain_cache_lock:
+        entry = _chain_cache.get(key)
+        if entry and (time.monotonic() - entry[1]) < _CHAIN_CACHE_TTL:
+            return entry[0]
+    return None
+
+
+def _set_chain_cached(ticker: str, run_date: str, chain) -> None:
+    key = f"{ticker.upper()}:{run_date}"
+    with _chain_cache_lock:
+        _chain_cache[key] = (chain, time.monotonic())
+
+
+# ---------------------------------------------------------------------------
+# opsp module singleton — avoid re-importing on every reprice call
+# ---------------------------------------------------------------------------
+_opsp_module = None
+_opsp_lock = threading.Lock()
+
+
+def _get_opsp():
+    """Return the cached opsp module, importing it exactly once per process."""
+    global _opsp_module
+    if _opsp_module is not None:
+        return _opsp_module
+    with _opsp_lock:
+        if _opsp_module is None:
+            import importlib.util as _ilu
+            _path = os.path.join(_SCRIPTS_DIR, "opsp.py")
+            if not os.path.exists(_path):
+                raise FileNotFoundError(f"opsp.py not found at {_path}")
+            _spec = _ilu.spec_from_file_location("opsp", _path)
+            _mod = _ilu.module_from_spec(_spec)  # type: ignore[arg-type]
+            _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+            _opsp_module = _mod
+    return _opsp_module
+
+
+def prewarm_spot_cache(tickers: list) -> None:
+    """
+    Pre-fetch EODHD live prices for *tickers* in parallel so the first
+    browser reprice poll gets instant spot values from cache.
+    Called once after recommendations are loaded on startup.
+    """
+    import concurrent.futures
+
+    def _fetch_one(t: str):
+        try:
+            opsp = _get_opsp()
+            if not hasattr(opsp, "fetch_eodhd_live_price"):
+                return
+            price = opsp.fetch_eodhd_live_price(t)
+            if price and price > 0:
+                _set_live_spot_cached(t, price)
+        except Exception:
+            pass
+
+    unique = list(dict.fromkeys(t.upper() for t in tickers if t))
+    if not unique:
+        return
+    logger.info("[spot-prewarm] Pre-warming EODHD spot cache for %d tickers…", len(unique))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        ex.map(_fetch_one, unique)
+    cached = sum(1 for t in unique if _get_live_spot_cached(t) is not None)
+    logger.info("[spot-prewarm] Done. %d/%d tickers cached.", cached, len(unique))
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -51,6 +157,8 @@ RECS_DIR            = os.path.join(OPTIONSYS_DATA_DIR, "options_recommendations"
 BACKTEST_DIR        = os.path.join(OPTIONSYS_DATA_DIR, "backtest_optsp_recommendations")
 HIST_CACHE_DIR      = os.path.join(OPTIONSYS_DATA_DIR, "historical_data_cache")
 OPTIONS_CACHE_DIR   = os.path.join(OPTIONSYS_DATA_DIR, "options_data_cache", "unicornbay", "options_eod")
+# ThetaData prefetch writes here (prefetch_options_datasp.py v3)
+THETADATA_SNAPSHOTS_DIR = os.path.join(OPTIONSYS_DATA_DIR, "options_data_cache", "thetadata", "snapshots")
 SYMBOLS_CSV         = os.path.join(OPTIONSYS_DATA_DIR, "sp500_symbols.csv")
 STATE_FILE          = os.path.join(OPTIONSYS_DATA_DIR, "backtest_optsp_state.json")
 SP500_DIFF_FILE     = os.path.join(OPTIONSYS_DATA_DIR, "sp500_diff.json")
@@ -59,6 +167,9 @@ OUTPUT_PREFIX = "iron_condor"
 ET = pytz.timezone("America/New_York")
 
 JOB_LOGS_FILE = os.path.join(OPTIONSYS_DATA_DIR, "options_job_logs.json")
+
+ACTIVE_TRADES_DATA_DIR = os.path.join(OPTIONSYS_DATA_DIR, "data")
+ACTIVE_TRADES_JSON = os.path.join(ACTIVE_TRADES_DATA_DIR, "active_trades.json")
 
 # Friendly display names for each script
 _SCRIPT_LABELS: Dict[str, str] = {
@@ -228,7 +339,7 @@ def _run_script(
     script_name: str,
     extra_args: Optional[List[str]] = None,
     extra_env: Optional[Dict[str, str]] = None,
-    timeout: int = 3600,
+    timeout: Optional[int] = 3600,
     job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -237,10 +348,12 @@ def _run_script(
     """
     env = os.environ.copy()
     env["STOCK_BASE_DIR"] = OPTIONSYS_DATA_DIR
+    env["PYTHONUNBUFFERED"] = "1"  # force unbuffered output so captured even on crash/kill
     if extra_env:
         env.update(extra_env)
 
-    cmd = [sys.executable, _script(script_name)] + (extra_args or [])
+    # -u: unbuffered stdout/stderr so every log line is visible even if the process is killed
+    cmd = [sys.executable, "-u", _script(script_name)] + (extra_args or [])
     label = _SCRIPT_LABELS.get(script_name, script_name)
     started_at = datetime.now(ET).isoformat()
     t0 = time.monotonic()
@@ -287,11 +400,11 @@ def _run_script(
         reader_thread = threading.Thread(target=_stream_output, daemon=True)
         reader_thread.start()
 
-        deadline = t0 + timeout
+        deadline = (t0 + timeout) if timeout is not None else None
         try:
             while True:
                 elapsed = time.monotonic() - t0
-                if elapsed >= timeout:
+                if timeout is not None and elapsed >= timeout:
                     proc.kill()
                     reader_thread.join(timeout=5)
                     raise subprocess.TimeoutExpired(cmd, timeout)
@@ -363,16 +476,28 @@ def _run_script(
     except subprocess.TimeoutExpired:
         duration_s = round(time.monotonic() - t0, 1)
         logger.error(f"[job] TIMEOUT {label} after {timeout}s")
+        # Include any output captured so far so user can see where the script got stuck
+        try:
+            stdout_tail = "\n".join(output_lines[-200:])[-3000:] if output_lines else ""
+        except NameError:
+            stdout_tail = ""
         running_entry.update({
-            "ended_at":   datetime.now(ET).isoformat(),
-            "duration_s": duration_s,
-            "ok":         False,
-            "status":     "timeout",
+            "ended_at":    datetime.now(ET).isoformat(),
+            "duration_s":  duration_s,
+            "ok":          False,
+            "status":      "timeout",
+            "stdout_tail": stdout_tail,
             "stderr_tail": f"Timed out after {timeout}s",
-            "summary":    f"Timed out after {timeout}s",
+            "summary":     f"Timed out after {timeout}s",
         })
         _save_job_logs()
-        return {"returncode": -1, "stdout": "", "stderr": "Timeout", "ok": False, "duration_s": duration_s}
+        return {
+            "returncode": -1,
+            "stdout": stdout_tail,
+            "stderr": f"Timed out after {timeout}s",
+            "ok": False,
+            "duration_s": duration_s,
+        }
     except Exception as exc:
         duration_s = round(time.monotonic() - t0, 1)
         logger.error(f"[job] ERROR  {label}: {exc}")
@@ -445,6 +570,21 @@ def _read_symbols_set() -> set:
         return set()
 
 
+def get_symbols_missing_today_cache() -> List[str]:
+    """
+    Return S&P 500 symbols that are missing today's ThetaData options cache file.
+    Used by Sync Data to prefetch only what's missing (v3 endpoints).
+    """
+    today_str = date.today().isoformat()
+    symbols = sorted(_read_symbols_set())
+    missing: List[str] = []
+    for ticker in symbols:
+        path = os.path.join(THETADATA_SNAPSHOTS_DIR, ticker, f"{today_str}.json.gz")
+        if not os.path.isfile(path):
+            missing.append(ticker)
+    return missing
+
+
 def _save_sp500_diff(before: set, after: set) -> Dict[str, Any]:
     """Compute before→after diff and persist to sp500_diff.json."""
     added   = sorted(after - before)
@@ -501,27 +641,79 @@ def run_fetch_sp500() -> Dict[str, Any]:
     return result
 
 
-def run_prefetch(years: Optional[List[int]] = None) -> Dict[str, Any]:
-    """Run prefetch_options_datasp.py (ThetaData Terminal) for the given years."""
+def run_prefetch(
+    years: Optional[List[int]] = None,
+    today_only: bool = False,
+    tickers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Run prefetch_options_datasp.py (ThetaData v3). Either today_only + optional tickers,
+    or years for full range. EODHD is used by opsp when generating recommendations after sync.
+    """
+    if today_only:
+        args = ["--today"]
+        if tickers:
+            args += ["--tickers"] + [str(t).upper() for t in tickers]
+        return _run_script("prefetch_options_datasp.py", extra_args=args, timeout=None)
     if not years:
         years = [date.today().year]
     args = ["--years"] + [str(y) for y in years]
-    return _run_script("prefetch_options_datasp.py", extra_args=args, timeout=7200)
+    return _run_script("prefetch_options_datasp.py", extra_args=args, timeout=None)
 
 
 def run_optsp(
     run_date: Optional[str] = None,
     *,
     job_id: Optional[str] = None,
+    max_trades: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Run opsp.py (ThetaData Terminal) to generate iron condor recommendations.
-    Connects to ThetaData Terminal at 127.0.0.1:25510. No API rate limits.
+    Uses EODHD_API_TOKEN for live underlying prices when run_date is today.
+    max_trades: 10–100 (default 40 when omitted).
     """
     args: List[str] = []
     if run_date:
         args += ["--run-date", run_date]
+    if max_trades is not None:
+        n = max(10, min(100, int(max_trades)))
+        args += ["--max-trades", str(n)]
     return _run_script("opsp.py", extra_args=args, timeout=1800, job_id=job_id)
+
+
+def run_sync_data(years: Optional[List[int]] = None) -> None:
+    """
+    Sync only: (1) Prefetch today's cache for any missing S&P 500 symbols (v3),
+    (2) If years provided, run full prefetch for those years. No recommendations
+    generation; runs in background; job logs and morning status update when done.
+
+    DO NOT add run_optsp() here — Sync Data must only sync; recommendations
+    are generated only when the user explicitly clicks Generate Recommendations.
+    """
+    missing = get_symbols_missing_today_cache()
+    if missing:
+        logger.info(f"[sync] Prefetching today for {len(missing)} symbols with missing cache")
+        run_prefetch(today_only=True, tickers=missing)
+    else:
+        logger.info("[sync] Today's cache complete for all symbols, skipping prefetch")
+    if years:
+        logger.info(f"[sync] Prefetching years {years}")
+        run_prefetch(years=years)
+
+
+def run_ibkr_ping(port: int = 7497, client_id: int = 1) -> Dict[str, Any]:
+    """
+    Connect to IBKR, print managed accounts, disconnect, and exit.
+    Fast (~5 s on success).  Returns the same dict shape as _run_script.
+    """
+    args = [
+        "--test-connection",
+        "--port", str(port),
+        "--client-id", str(client_id),
+    ]
+    # Allow up to 130 s: exeopt tries multiple hosts (127.0.0.1, localhost, ::1),
+    # each with 60 s connect timeout, so we need >60 s to get the real error back.
+    return _run_script("exeopt.py", extra_args=args, timeout=130)
 
 
 def run_exeopt(
@@ -557,7 +749,11 @@ def run_exeopt(
     # Risk management
     args += ["--stop-loss-pct", str(stop_loss_pct)]
     args += ["--take-profit-pct", str(take_profit_pct)]
-    return _run_script("exeopt.py", extra_args=args, timeout=300)
+    # 420 s (7 min): the connect timeout is now 60 s, plus order execution can
+    # take up to 120 s waiting for entry fill, so the script can legitimately run
+    # ~3 min for a multi-ticker run.  Flutter receiveTimeout is 8 min (480 s),
+    # leaving 60 s for FastAPI to serialize and return the response.
+    return _run_script("exeopt.py", extra_args=args, timeout=420)
 
 
 # ---------------------------------------------------------------------------
@@ -1163,7 +1359,18 @@ def get_recommendations(rec_date: Optional[str] = None) -> List[Dict[str, Any]]:
     try:
         df = pd.read_csv(path)
         df = df.where(pd.notna(df), None)
-        return df.to_dict(orient="records")
+        records = df.to_dict(orient="records")
+        # Explicit sort by score descending so frontend receives stable order (no client-side re-sort).
+        def _score_key(r: Dict[str, Any]) -> float:
+            s = r.get("score")
+            if s is None or (isinstance(s, float) and pd.isna(s)):
+                return float("-inf")
+            try:
+                return float(s)
+            except (TypeError, ValueError):
+                return float("-inf")
+        records.sort(key=_score_key, reverse=True)
+        return records
     except Exception as exc:
         logger.error(f"Failed to read recs for {target_date}: {exc}")
         return []
@@ -1177,6 +1384,396 @@ def get_symbols() -> List[str]:
     except Exception as exc:
         logger.error(f"Failed to read symbols: {exc}")
         return []
+
+
+def save_symbols(symbols: List[str]) -> None:
+    """Overwrite the symbols CSV with a new list (upload custom stock universe)."""
+    os.makedirs(os.path.dirname(SYMBOLS_CSV), exist_ok=True)
+    df = pd.DataFrame({"symbol": [s.upper().strip() for s in symbols if s.strip()]})
+    df.to_csv(SYMBOLS_CSV, index=False)
+    logger.info(f"Saved {len(df)} symbols to {SYMBOLS_CSV}")
+
+
+# Packaged default: the sp500_symbols.csv bundled alongside opsp.py
+_SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "options")
+_DEFAULT_SYMBOLS_CSV = os.path.join(_SCRIPTS_DIR, "sp500_symbols.csv")
+
+
+def restore_default_symbols() -> Tuple[int, List[str]]:
+    """Restore SYMBOLS_CSV from the bundled default SP500 list."""
+    if not os.path.exists(_DEFAULT_SYMBOLS_CSV):
+        raise FileNotFoundError(
+            f"Default symbols file not found at {_DEFAULT_SYMBOLS_CSV}"
+        )
+    df = pd.read_csv(_DEFAULT_SYMBOLS_CSV)
+    col = "symbol" if "symbol" in df.columns else df.columns[0]
+    symbols = df[col].dropna().str.strip().str.upper().tolist()
+    save_symbols(symbols)
+    return len(symbols), symbols[:10]
+
+
+# ---------------------------------------------------------------------------
+# Reprice a specific iron-condor set using fresh ThetaData quotes
+# ---------------------------------------------------------------------------
+
+# Validity severity constants (tunable)
+VALIDITY_MIN_PREMIUM = 0.05
+VALIDITY_SPREAD_CAUTION_ABS = 0.10
+VALIDITY_SPREAD_CAUTION_PCT = 0.15
+VALIDITY_SPREAD_NOT_IDEAL_ABS = 0.25
+VALIDITY_SPREAD_NOT_IDEAL_PCT = 0.30
+VALIDITY_DEBIT_CAUTION_MAX = 0.20  # $/contract; debit magnitude <= this -> caution
+VALIDITY_SPOT_BUFFER_FALLBACK = 0.50  # $; fallback when spot is None
+VALIDITY_SLIPPAGE = 0.95  # 5% slippage: net_premium = total_mid * this
+VALIDITY_PACKAGE_SPREAD_MAX_PCT = 0.40  # package spread > this fraction of premium -> not_ideal
+
+
+def _build_reprice_response(
+    *,
+    ticker: str,
+    spot: Optional[float],
+    sp_bid: float, sp_ask: float, sp_mid: float,
+    lp_bid: float, lp_ask: float, lp_mid: float,
+    sc_bid: float, sc_ask: float, sc_mid: float,
+    lc_bid: float, lc_ask: float, lc_mid: float,
+    net_conservative: float,
+    net_mid: float,
+    net_premium: float,
+    total_spread_pct: float,
+    be_lower: float,
+    be_upper: float,
+    max_profit_usd: float,
+    max_loss_usd: float,
+    max_loss_per_share: float,
+    debug: Dict[str, Any],
+    strict_validity: bool,
+) -> Dict[str, Any]:
+    """Compute validity with severity (valid/caution/not_ideal) and build response."""
+    validity_reasons: List[str] = []
+    severity_level = 0  # 0=valid, 1=caution, 2=not_ideal
+
+    # Distance of spot from breakeven range: 0 if inside, positive if outside
+    distance_from_be: Optional[float] = None
+    if spot is not None:
+        if spot < be_lower:
+            distance_from_be = be_lower - spot
+        elif spot > be_upper:
+            distance_from_be = spot - be_upper
+        else:
+            distance_from_be = 0.0
+
+    # Dynamic breakeven buffer: 0.5% of spot, fallback when spot is None
+    spot_buffer = (spot * 0.005) if (spot is not None and spot > 0) else VALIDITY_SPOT_BUFFER_FALLBACK
+
+    if strict_validity:
+        # Original strict: any issue = not valid (use net_premium for premium/debit checks)
+        if abs(net_premium) < VALIDITY_MIN_PREMIUM:
+            validity_reasons.append(
+                f"Net premium too low (${net_premium:.2f} < ${VALIDITY_MIN_PREMIUM:.2f})"
+            )
+        if spot is not None:
+            if spot < be_lower:
+                validity_reasons.append(f"Spot ${spot:.2f} is below BE Lower {be_lower:.2f}")
+            elif spot > be_upper:
+                validity_reasons.append(f"Spot {spot:.2f} is above BE Upper {be_upper:.2f}")
+        for name, bid, ask in [
+            ("ShortPut", sp_bid, sp_ask),
+            ("LongPut", lp_bid, lp_ask),
+            ("ShortCall", sc_bid, sc_ask),
+            ("LongCall", lc_bid, lc_ask),
+        ]:
+            mid = (bid + ask) / 2.0
+            if mid > 0 and abs(ask - bid) / mid > 0.40:
+                validity_reasons.append(f"Wide spread on {name}")
+        if net_premium < 0:
+            validity_reasons.append("Net premium is a debit (not a credit)")
+        is_valid = len(validity_reasons) == 0
+        validity_severity = "valid" if is_valid else "not_ideal"
+    else:
+        # Severity-based rules (use net_premium for Rule 1 and 4)
+        if abs(net_premium) < VALIDITY_MIN_PREMIUM:
+            validity_reasons.append(
+                f"Net premium too low (${net_premium:.2f} < ${VALIDITY_MIN_PREMIUM:.2f})"
+            )
+            severity_level = max(severity_level, 2)
+
+        if spot is not None:
+            if spot < be_lower:
+                dist = be_lower - spot
+                if dist <= spot_buffer:
+                    validity_reasons.append(
+                        f"Spot ${spot:.2f} is below BE Lower {be_lower:.2f} (within ${dist:.2f})"
+                    )
+                    severity_level = max(severity_level, 1)
+                else:
+                    validity_reasons.append(
+                        f"Spot {spot:.2f} is below BE Lower {be_lower:.2f} by {dist:.2f}"
+                    )
+                    severity_level = max(severity_level, 2)
+            elif spot > be_upper:
+                dist = spot - be_upper
+                if dist <= spot_buffer:
+                    validity_reasons.append(
+                        f"Spot {spot:.2f} is above BE Upper {be_upper:.2f} (within {dist:.2f})"
+                    )
+                    severity_level = max(severity_level, 1)
+                else:
+                    validity_reasons.append(
+                        f"Spot {spot:.2f} is above BE Upper {be_upper:.2f} by {dist:.2f}"
+                    )
+                    severity_level = max(severity_level, 2)
+
+        # Per-leg spread: at most caution (severity 1), never not_ideal from per-leg alone
+        for name, bid, ask in [
+            ("ShortPut", sp_bid, sp_ask),
+            ("LongPut", lp_bid, lp_ask),
+            ("ShortCall", sc_bid, sc_ask),
+            ("LongCall", lc_bid, lc_ask),
+        ]:
+            spread_abs = ask - bid
+            mid = (bid + ask) / 2.0
+            if mid <= 0:
+                continue
+            spread_pct = spread_abs / mid
+            thresh_caution_abs = VALIDITY_SPREAD_CAUTION_ABS
+            thresh_caution_pct = VALIDITY_SPREAD_CAUTION_PCT
+            thresh_not_abs = VALIDITY_SPREAD_NOT_IDEAL_ABS
+            thresh_not_pct = VALIDITY_SPREAD_NOT_IDEAL_PCT
+            if spread_abs > max(thresh_not_abs, thresh_not_pct * mid):
+                validity_reasons.append(
+                    f"Wide spread on {name}: ${spread_abs:.2f} ({spread_pct:.1%} of mid)"
+                )
+                severity_level = max(severity_level, 1)
+            elif spread_abs > max(thresh_caution_abs, thresh_caution_pct * mid):
+                validity_reasons.append(
+                    f"Wider spread on {name}: ${spread_abs:.2f} ({spread_pct:.1%} of mid)"
+                )
+                severity_level = max(severity_level, 1)
+
+        # Holistic: package spread > 40% of premium -> not_ideal
+        if total_spread_pct > VALIDITY_PACKAGE_SPREAD_MAX_PCT:
+            validity_reasons.append(
+                f"Package spread is >{VALIDITY_PACKAGE_SPREAD_MAX_PCT:.0%} of premium ({total_spread_pct:.1%})"
+            )
+            severity_level = max(severity_level, 2)
+
+        if net_premium < 0:
+            debit_mag = abs(net_premium)
+            if debit_mag <= VALIDITY_DEBIT_CAUTION_MAX:
+                validity_reasons.append(
+                    f"Net premium is a small debit (${debit_mag:.2f}/contract)"
+                )
+                severity_level = max(severity_level, 1)
+            else:
+                validity_reasons.append(
+                    f"Net premium is a debit (${debit_mag:.2f}/contract)"
+                )
+                severity_level = max(severity_level, 2)
+
+        validity_severity = "valid" if severity_level == 0 else ("caution" if severity_level == 1 else "not_ideal")
+        is_valid = severity_level == 0
+
+    status = "green" if severity_level == 0 else ("yellow" if severity_level == 1 else "red")
+
+    return {
+        "ok": True,
+        "ticker": ticker,
+        "spot": spot,
+        "spot_price": spot,
+        "sp_bid": sp_bid, "sp_ask": sp_ask, "sp_mid": sp_mid,
+        "lp_bid": lp_bid, "lp_ask": lp_ask, "lp_mid": lp_mid,
+        "sc_bid": sc_bid, "sc_ask": sc_ask, "sc_mid": sc_mid,
+        "lc_bid": lc_bid, "lc_ask": lc_ask, "lc_mid": lc_mid,
+        "net_premium_conservative": net_conservative,
+        "net_premium_mid": net_mid,
+        "net_mid_premium": net_premium,
+        "be_lower": be_lower,
+        "be_upper": be_upper,
+        "max_profit_usd": max_profit_usd,
+        "max_loss_usd": max_loss_usd,
+        "max_loss_per_share": max_loss_per_share,
+        "is_valid": is_valid,
+        "validity_severity": validity_severity,
+        "validity_reasons": validity_reasons,
+        "status": status,
+        "total_spread_percent": total_spread_pct,
+        "distance_from_be": distance_from_be,
+        "debug": debug,
+    }
+
+
+def reprice_iron_condor(
+    ticker: str,
+    expiration: str,   # YYYY-MM-DD
+    short_put: float,
+    long_put: float,
+    short_call: float,
+    long_call: float,
+    contracts: int = 1,
+    width: Optional[float] = None,
+    strict_validity: bool = False,
+) -> Dict[str, Any]:
+    """Fetch fresh quotes for the four legs and return updated metrics + validity check."""
+    opsp = _get_opsp()
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Use short-lived in-memory chain cache to avoid hammering ThetaTerminal on
+    # every card poll (N cards × every 4 s = N fetches/4 s without this cache).
+    chain = _get_chain_cached(ticker, today)
+    if chain is None:
+        chain = opsp.fetch_chain_for_ticker(
+            api_token="Not_Needed",
+            ticker=ticker,
+            run_date=today,
+            use_cache=False,
+            write_cache=False,
+        )
+        if chain is not None and not chain.empty:
+            _set_chain_cached(ticker, today, chain)
+
+    NAN = float("nan")
+
+    def _get_leg_quotes(strike: float, opt_type: str) -> Dict[str, float]:
+        """Find bid/ask for a specific strike+type in the chain."""
+        if chain is None or chain.empty:
+            return {"bid": NAN, "ask": NAN, "mid": NAN}
+        t_col = None
+        for c in ["type", "_type", "right"]:
+            if c in chain.columns:
+                t_col = c
+                break
+        s_col = None
+        for c in ["strike", "_strike"]:
+            if c in chain.columns:
+                s_col = c
+                break
+        if t_col is None or s_col is None:
+            return {"bid": NAN, "ask": NAN, "mid": NAN}
+
+        import numpy as np
+        type_filter = chain[t_col].astype(str).str.lower().str.startswith(opt_type[0].lower())
+        strike_filter = np.isclose(pd.to_numeric(chain[s_col], errors="coerce").fillna(-1), strike, atol=0.01)
+        mask = type_filter & strike_filter
+
+        # Also try matching against target expiration date
+        for exp_col in ["exp_date", "_exp", "expiration"]:
+            if exp_col in chain.columns:
+                exp_filter = chain[exp_col].astype(str).str.startswith(expiration[:7])  # match YYYY-MM
+                if exp_filter.any():
+                    mask = mask & exp_filter
+                break
+
+        rows = chain[mask]
+        if rows.empty:
+            return {"bid": NAN, "ask": NAN, "mid": NAN}
+        row = rows.iloc[0]
+        bid = float(pd.to_numeric(row.get("bid", NAN), errors="coerce") or NAN)
+        ask = float(pd.to_numeric(row.get("ask", NAN), errors="coerce") or NAN)
+        mid = (bid + ask) / 2.0 if not (pd.isna(bid) or pd.isna(ask)) else NAN
+        return {"bid": bid, "ask": ask, "mid": mid}
+
+    sp_q = _get_leg_quotes(short_put,  "put")
+    lp_q = _get_leg_quotes(long_put,   "put")
+    sc_q = _get_leg_quotes(short_call, "call")
+    lc_q = _get_leg_quotes(long_call,  "call")
+
+    def _safe(v: float, fallback: float = 0.0) -> float:
+        return fallback if (v is None or pd.isna(v)) else float(v)
+
+    sp_bid  = _safe(sp_q["bid"])
+    sp_ask  = _safe(sp_q["ask"])
+    lp_bid  = _safe(lp_q["bid"])
+    lp_ask  = _safe(lp_q["ask"])
+    sc_bid  = _safe(sc_q["bid"])
+    sc_ask  = _safe(sc_q["ask"])
+    lc_bid  = _safe(lc_q["bid"])
+    lc_ask  = _safe(lc_q["ask"])
+    sp_mid  = _safe(sp_q["mid"])
+    lp_mid  = _safe(lp_q["mid"])
+    sc_mid  = _safe(sc_q["mid"])
+    lc_mid  = _safe(lc_q["mid"])
+
+    # Conservative: sell@bid, buy@ask (kept for response/debug)
+    net_conservative = sp_bid - lp_ask + sc_bid - lc_ask
+    # Mid estimate
+    net_mid = sp_mid - lp_mid + sc_mid - lc_mid
+    # Pro-Fill: aggressive fill weighted 75% mid / 25% conservative
+    net_premium = (net_mid * 0.75) + (net_conservative * 0.25)
+
+    w = width if width is not None else abs(short_put - long_put)
+    net_abs = abs(net_premium)
+    max_loss_per_share = max(0.0, w - net_abs)
+    max_profit_usd = net_abs * 100 * contracts
+    max_loss_usd = max_loss_per_share * 100 * contracts
+    be_lower = short_put - net_abs if net_premium > 0 else short_put + net_abs
+    be_upper = short_call + net_abs if net_premium > 0 else short_call - net_abs
+
+    # Spot: prefer EODHD live price (cached 60 s to avoid rate-limiting from
+    # concurrent reprice polls), then fall back to most-recent cached close.
+    spot: Optional[float] = None
+    try:
+        spot = _get_live_spot_cached(ticker)
+        if spot is None or spot <= 0:
+            if hasattr(opsp, "fetch_eodhd_live_price"):
+                fetched = opsp.fetch_eodhd_live_price(ticker)
+                if fetched and fetched > 0:
+                    _set_live_spot_cached(ticker, fetched)
+                    spot = fetched
+        if spot is None or spot <= 0:
+            price_df = opsp.load_price_df_cached(ticker)
+            if price_df is not None:
+                spot = opsp.get_close_on_date(price_df, today)
+    except Exception:
+        pass
+
+    # Per-leg spreads for debug
+    def _spread(bid: float, ask: float) -> float:
+        return ask - bid if (bid and ask) else 0.0
+
+    sp_spread = _spread(sp_bid, sp_ask)
+    lp_spread = _spread(lp_bid, lp_ask)
+    sc_spread = _spread(sc_bid, sc_ask)
+    lc_spread = _spread(lc_bid, lc_ask)
+    total_spread = sp_spread + lp_spread + sc_spread + lc_spread
+    total_spread_pct = total_spread / max(abs(net_premium), 1e-6)
+
+    # Debug block (always included)
+    _now_utc = datetime.now(timezone.utc)
+    debug = {
+        "spot": spot,
+        "legs": {
+            "short_put": {"bid": sp_bid, "ask": sp_ask, "mid": sp_mid, "spread": sp_spread},
+            "long_put": {"bid": lp_bid, "ask": lp_ask, "mid": lp_mid, "spread": lp_spread},
+            "short_call": {"bid": sc_bid, "ask": sc_ask, "mid": sc_mid, "spread": sc_spread},
+            "long_call": {"bid": lc_bid, "ask": lc_ask, "mid": lc_mid, "spread": lc_spread},
+        },
+        "net_premium_conservative": net_conservative,
+        "net_premium_mid": net_mid,
+        "be_lower": be_lower,
+        "be_upper": be_upper,
+        "server_timestamp_utc": _now_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    }
+
+    return _build_reprice_response(
+        ticker=ticker,
+        spot=spot,
+        sp_bid=sp_bid, sp_ask=sp_ask, sp_mid=sp_mid,
+        lp_bid=lp_bid, lp_ask=lp_ask, lp_mid=lp_mid,
+        sc_bid=sc_bid, sc_ask=sc_ask, sc_mid=sc_mid,
+        lc_bid=lc_bid, lc_ask=lc_ask, lc_mid=lc_mid,
+        net_conservative=net_conservative,
+        net_mid=net_mid,
+        net_premium=net_premium,
+        total_spread_pct=total_spread_pct,
+        be_lower=be_lower,
+        be_upper=be_upper,
+        max_profit_usd=max_profit_usd,
+        max_loss_usd=max_loss_usd,
+        max_loss_per_share=max_loss_per_share,
+        debug=debug,
+        strict_validity=strict_validity,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1321,3 +1918,441 @@ def get_morning_status() -> Dict[str, Any]:
         "latest_rec_date":   get_latest_rec_date(),
         "latest_rec_count":  len(get_recommendations()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Actual fills — per-user persistence (SQLite)
+# ---------------------------------------------------------------------------
+
+import sqlite3
+
+ACTUAL_FILLS_DB = os.path.join(OPTIONSYS_DATA_DIR, "actual_fills.db")
+
+
+def _actual_fills_conn():
+    os.makedirs(os.path.dirname(ACTUAL_FILLS_DB) or ".", exist_ok=True)
+    conn = sqlite3.connect(ACTUAL_FILLS_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_actual_fills_table(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS actual_fills (
+            user_id TEXT NOT NULL,
+            rec_key TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            expiration TEXT NOT NULL,
+            short_put REAL NOT NULL,
+            long_put REAL NOT NULL,
+            short_call REAL NOT NULL,
+            long_call REAL NOT NULL,
+            actual_net_premium_per_contract REAL NOT NULL,
+            actual_contracts INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, rec_key)
+        )
+    """)
+    conn.commit()
+    # Add columns for entry/exit and active state (idempotent migration)
+    for col_def in [
+        "is_entered INTEGER DEFAULT 1",
+        "is_active INTEGER DEFAULT 1",
+        "entry_date TEXT",
+        "exit_price REAL",
+        "exit_date TEXT",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE actual_fills ADD COLUMN {col_def}")
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower():
+                pass
+            else:
+                raise
+
+
+def _load_active_trades_json() -> Dict[str, List[Dict[str, Any]]]:
+    """Load full active_trades file: { user_id: [ {...}, ... ] }."""
+    if not os.path.exists(ACTIVE_TRADES_JSON):
+        return {}
+    try:
+        with open(ACTIVE_TRADES_JSON) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_active_trades_json(data: Dict[str, List[Dict[str, Any]]]) -> None:
+    os.makedirs(ACTIVE_TRADES_DATA_DIR, exist_ok=True)
+    with open(ACTIVE_TRADES_JSON, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_active_trades(user_id: str) -> List[Dict[str, Any]]:
+    """Return list of active trade records for the user."""
+    data = _load_active_trades_json()
+    return data.get(user_id, [])
+
+
+def save_active_trades(user_id: str, trades: List[Dict[str, Any]]) -> None:
+    """Overwrite active trades list for the user."""
+    data = _load_active_trades_json()
+    data[user_id] = trades
+    _save_active_trades_json(data)
+
+
+def _sync_actual_fill_to_active_trades(
+    user_id: str,
+    rec_key: str,
+    ticker: str,
+    expiration: str,
+    short_put: float,
+    long_put: float,
+    short_call: float,
+    long_call: float,
+    entry_credit: float,
+    contracts: Optional[int] = None,
+    entry_pop: Optional[float] = None,
+) -> None:
+    """Add or update one active trade from an actual fill."""
+    trades = load_active_trades(user_id)
+    n = contracts if contracts is not None else 1
+    record = {
+        "rec_key": rec_key,
+        "ticker": ticker,
+        "exp": expiration,
+        "short_put": short_put,
+        "long_put": long_put,
+        "short_call": short_call,
+        "long_call": long_call,
+        "entry_credit": entry_credit,
+        "entry_pop": entry_pop,
+        "contracts": n,
+    }
+    # Upsert by rec_key
+    trades = [t for t in trades if t.get("rec_key") != rec_key]
+    trades.append(record)
+    save_active_trades(user_id, trades)
+
+
+def upsert_actual_fill(
+    user_id: str,
+    rec_key: str,
+    ticker: str,
+    expiration: str,
+    short_put: float,
+    long_put: float,
+    short_call: float,
+    long_call: float,
+    actual_net_premium_per_contract: float,
+    actual_contracts: Optional[int] = None,
+    entry_pop: Optional[float] = None,
+    is_entered: bool = True,
+) -> Dict[str, Any]:
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry_date = date.today().isoformat() if is_entered else None
+    conn = _actual_fills_conn()
+    try:
+        _init_actual_fills_table(conn)
+        conn.execute(
+            """
+            INSERT INTO actual_fills (
+                user_id, rec_key, ticker, expiration, short_put, long_put,
+                short_call, long_call, actual_net_premium_per_contract, actual_contracts,
+                created_at, updated_at, is_entered, is_active, entry_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            ON CONFLICT (user_id, rec_key) DO UPDATE SET
+                ticker = excluded.ticker,
+                expiration = excluded.expiration,
+                short_put = excluded.short_put,
+                long_put = excluded.long_put,
+                short_call = excluded.short_call,
+                long_call = excluded.long_call,
+                actual_net_premium_per_contract = excluded.actual_net_premium_per_contract,
+                actual_contracts = excluded.actual_contracts,
+                updated_at = excluded.updated_at,
+                is_entered = excluded.is_entered,
+                entry_date = CASE WHEN excluded.is_entered = 1 THEN excluded.entry_date ELSE actual_fills.entry_date END
+            """,
+            (
+                user_id, rec_key, ticker, expiration, short_put, long_put,
+                short_call, long_call, actual_net_premium_per_contract, actual_contracts,
+                now, now, 1 if is_entered else 0, entry_date,
+            ),
+        )
+        conn.commit()
+        if is_entered:
+            _sync_actual_fill_to_active_trades(
+                user_id=user_id,
+                rec_key=rec_key,
+                ticker=ticker,
+                expiration=expiration,
+                short_put=short_put,
+                long_put=long_put,
+                short_call=short_call,
+                long_call=long_call,
+                entry_credit=actual_net_premium_per_contract,
+                contracts=actual_contracts,
+                entry_pop=entry_pop,
+            )
+        return {"ok": True, "rec_key": rec_key}
+    finally:
+        conn.close()
+
+
+def get_actual_fills(
+    user_id: str,
+    date_filter: Optional[str] = None,
+    tickers: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Return all actual fills for the user as a dict keyed by rec_key.
+    If date_filter (YYYY-MM-DD) is set, only return fills whose expiration matches that date
+    (or rec_key contains that date). If tickers is set, only return fills for those tickers.
+    """
+    conn = _actual_fills_conn()
+    try:
+        _init_actual_fills_table(conn)
+        query = "SELECT * FROM actual_fills WHERE user_id = ?"
+        params: List[Any] = [user_id]
+        if date_filter:
+            query += " AND (expiration = ? OR rec_key LIKE ?)"
+            params.extend([date_filter, f"%|{date_filter}|%"])
+        if tickers:
+            placeholders = ",".join("?" * len(tickers))
+            query += f" AND ticker IN ({placeholders})"
+            params.extend([t.upper() for t in tickers])
+        query += " ORDER BY updated_at DESC"
+        cur = conn.execute(query, params)
+        rows = cur.fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            r = dict(row)
+            rec_key = r["rec_key"]
+            out[rec_key] = {
+                "rec_key": rec_key,
+                "ticker": r["ticker"],
+                "expiration": r["expiration"],
+                "short_put": r["short_put"],
+                "long_put": r["long_put"],
+                "short_call": r["short_call"],
+                "long_call": r["long_call"],
+                "actual_net_premium_per_contract": r["actual_net_premium_per_contract"],
+                "actual_contracts": r["actual_contracts"],
+                "created_at": r["created_at"],
+                "updated_at": r["updated_at"],
+                "is_entered": r.get("is_entered", 1),
+                "is_active": r.get("is_active", 1),
+                "entry_date": r.get("entry_date"),
+                "exit_price": r.get("exit_price"),
+                "exit_date": r.get("exit_date"),
+            }
+        return out
+    finally:
+        conn.close()
+
+
+def delete_actual_fill(user_id: str, rec_key: str) -> bool:
+    conn = _actual_fills_conn()
+    try:
+        _init_actual_fills_table(conn)
+        cur = conn.execute(
+            "DELETE FROM actual_fills WHERE user_id = ? AND rec_key = ?",
+            (user_id, rec_key),
+        )
+        conn.commit()
+        deleted = cur.rowcount > 0
+        if deleted:
+            trades = [t for t in load_active_trades(user_id) if t.get("rec_key") != rec_key]
+            save_active_trades(user_id, trades)
+        return deleted
+    finally:
+        conn.close()
+
+
+def delete_all_actual_fills(user_id: str) -> int:
+    """Delete all actual_fills rows for this user and clear their active_trades JSON. Returns number of rows deleted."""
+    conn = _actual_fills_conn()
+    try:
+        _init_actual_fills_table(conn)
+        cur = conn.execute(
+            "DELETE FROM actual_fills WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+        deleted = cur.rowcount
+        save_active_trades(user_id, [])
+        return deleted
+    finally:
+        conn.close()
+
+
+def set_actual_fill_exit(
+    user_id: str,
+    rec_key: str,
+    exit_price: float,
+    exit_date: str,
+) -> bool:
+    """Mark a position as exited: set is_active=0, exit_price, exit_date. Returns True if updated."""
+    conn = _actual_fills_conn()
+    try:
+        _init_actual_fills_table(conn)
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        cur = conn.execute(
+            """
+            UPDATE actual_fills
+            SET is_active = 0, exit_price = ?, exit_date = ?, updated_at = ?
+            WHERE user_id = ? AND rec_key = ?
+            """,
+            (exit_price, exit_date, now, user_id, rec_key),
+        )
+        conn.commit()
+        updated = cur.rowcount > 0
+        if updated:
+            trades = [t for t in load_active_trades(user_id) if t.get("rec_key") != rec_key]
+            save_active_trades(user_id, trades)
+        return updated
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Active positions — from actual_fills (is_entered=1, is_active=1) with live P&L
+# ---------------------------------------------------------------------------
+
+POP_WARNING_DROP_PCT = 0.10  # flag when updated_pop drops >= 10 pp below entry_pop
+
+
+def _compute_updated_pop(spot: Optional[float], short_put: float, short_call: float, expiration: str) -> Optional[float]:
+    """Estimate POP using opsp lognormal with default IV. Returns None if spot missing or invalid."""
+    if spot is None or not (spot > 0):
+        return None
+    try:
+        exp_dt = datetime.strptime(expiration[:10], "%Y-%m-%d")
+        today = date.today()
+        dte = max(0, (exp_dt.date() - today).days)
+        if dte <= 0:
+            return None
+        try:
+            opsp = _get_opsp()
+        except Exception:
+            return None
+        if hasattr(opsp, "_calc_pop_lognormal"):
+            iv = 0.25
+            return opsp._calc_pop_lognormal(spot, short_put, short_call, iv, dte)
+    except Exception:
+        pass
+    return None
+
+
+def _get_active_fills_rows(user_id: str) -> List[Dict[str, Any]]:
+    """Return rows from actual_fills where is_entered=1 and is_active=1 (or columns missing for back compat)."""
+    conn = _actual_fills_conn()
+    try:
+        _init_actual_fills_table(conn)
+        cur = conn.execute(
+            """
+            SELECT * FROM actual_fills
+            WHERE user_id = ?
+              AND (COALESCE(is_entered, 1) = 1)
+              AND (COALESCE(is_active, 1) = 1)
+            ORDER BY updated_at DESC
+            """,
+            (user_id,),
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_active_positions_with_stats(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Load active positions from actual_fills (is_entered=1, is_active=1), compute current P&L and updated POP.
+    P&L = (entry_credit - current_combo_mid) * 100 * contracts.
+    pop_warning = True when updated_pop drops >= POP_WARNING_DROP_PCT below entry_pop.
+    """
+    rows = _get_active_fills_rows(user_id)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        rec_key = r.get("rec_key", "")
+        ticker = r.get("ticker", "")
+        exp = r.get("expiration", "") or r.get("exp", "")
+        short_put = float(r.get("short_put", 0))
+        long_put = float(r.get("long_put", 0))
+        short_call = float(r.get("short_call", 0))
+        long_call = float(r.get("long_call", 0))
+        entry_credit = float(r.get("actual_net_premium_per_contract", 0))
+        entry_pop = r.get("entry_pop")
+        if entry_pop is not None:
+            entry_pop = float(entry_pop)
+        contracts = int(r.get("actual_contracts", 1) or 1)
+        entry_date = r.get("entry_date")
+
+        current_combo_mid: Optional[float] = None
+        spot: Optional[float] = None
+        try:
+            rep = reprice_iron_condor(
+                ticker=ticker,
+                expiration=exp,
+                short_put=short_put,
+                long_put=long_put,
+                short_call=short_call,
+                long_call=long_call,
+                contracts=contracts,
+            )
+            current_combo_mid = rep.get("net_premium_mid")
+            spot = rep.get("spot")
+        except Exception:
+            pass
+
+        if current_combo_mid is not None:
+            current_pl = (entry_credit - current_combo_mid) * 100 * contracts
+            current_pl_pct = (current_pl / (entry_credit * 100 * contracts)) if (entry_credit * contracts) else None
+        else:
+            current_pl = None
+            current_pl_pct = None
+
+        updated_pop = _compute_updated_pop(spot, short_put, short_call, exp)
+        pop_warning = False
+        if entry_pop is not None and updated_pop is not None:
+            if (entry_pop - updated_pop) >= POP_WARNING_DROP_PCT:
+                pop_warning = True
+
+        width = abs(short_put - long_put) if short_put and long_put else 0
+        max_risk_per_share = max(0.0, width - abs(entry_credit)) if width else 0
+        max_risk_usd = max_risk_per_share * 100 * contracts if max_risk_per_share else None
+
+        row: Dict[str, Any] = {
+            "rec_key": rec_key,
+            "ticker": ticker,
+            "expiration": exp,
+            "short_put": short_put,
+            "long_put": long_put,
+            "short_call": short_call,
+            "long_call": long_call,
+            "strategy_name": "Iron Condor",
+            "actual_net_premium_per_contract": entry_credit,
+            "actual_price": entry_credit,
+            "actual_contracts": contracts,
+            "entry_date": entry_date,
+            "live_price": spot,
+            "spot": spot,
+            "current_pl": current_pl,
+            "current_pl_pct": current_pl_pct,
+            "daily_pl": None,
+            "daily_pl_pct": None,
+            "sl_price": None,
+            "tp_price": None,
+            "max_risk_usd": max_risk_usd,
+            "updated_pop": updated_pop,
+            "pop_warning": pop_warning,
+            "is_active": True,
+            "exit_price": None,
+            "exit_date": None,
+            "current_combo_mid": current_combo_mid,
+        }
+        out.append(row)
+    return out

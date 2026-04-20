@@ -49,24 +49,38 @@ import os
 import sys
 import argparse
 import logging
+import time
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Tuple
 from decimal import Decimal
 import glob
 
-import pandas as pd
-from ib_insync import IB, Option, Contract, Order, LimitOrder, StopOrder, ComboLeg, ContractDetails
-from ib_insync import MarketOrder, StopLimitOrder
-
 # =========================
-# Logging
+# Logging — configured BEFORE third-party imports so that import errors are
+# captured with timestamps and visible in the subprocess output.
 # =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()],
+    handlers=[logging.StreamHandler(sys.stdout)],  # stdout so -u / PYTHONUNBUFFERED work
 )
 logger = logging.getLogger(__name__)
+
+# Print a flush=True banner immediately so the parent process always sees
+# at least one line even if the script crashes during import below.
+print("[exeopt] script starting", flush=True)
+
+import pandas as pd
+
+try:
+    from ib_insync import IB, Option, Contract, Order, LimitOrder, StopOrder, ComboLeg, ContractDetails
+    from ib_insync import MarketOrder, StopLimitOrder
+except ImportError as _import_err:
+    logger.error(
+        "ib_insync is not installed. Run: pip install ib_insync\n"
+        f"Import error: {_import_err}"
+    )
+    sys.exit(1)
 
 # =========================
 # Configuration
@@ -74,6 +88,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7497  # TWS Paper Trading: 7497, Live: 7496
 DEFAULT_CLIENT_ID = 1
+
+# How long ib_insync waits for the TWS API handshake to complete.
+# 60 s is needed because TWS may show a one-time "Allow API connections?"
+# dialog that requires manual confirmation.  The PERMANENT fix is to add
+# 127.0.0.1 to Trusted IP Addresses in TWS so the dialog never appears:
+#   TWS → Configure (gear) → API → Settings → Trusted IP Addresses → add 127.0.0.1
+CONNECT_TIMEOUT_SECONDS = 60
 
 # Risk management defaults
 DEFAULT_STOP_LOSS_PCT = 1.0  # Close position if loss reaches 100% of max_loss
@@ -96,17 +117,116 @@ class IBKROptionsExecutor:
         self.client_id = client_id
         self.connected = False
 
+    # ── TWS configuration required for reliable API connections ───────────────
+    # In TWS: Configure (gear icon) → API → Settings
+    #   ✓  Enable ActiveX and Socket Clients
+    #   ✓  Trusted IP Addresses → add 127.0.0.1   ← MOST IMPORTANT
+    #      (this skips the "Allow API connection?" confirmation dialog)
+    #   ✗  Read-Only API  (must be OFF to place orders)
+    # Without "Trusted IP Addresses", TWS pops a dialog on every new connection.
+    # If that dialog is not confirmed within CONNECT_TIMEOUT_SECONDS the handshake
+    # times out and exeopt fails.
+    # ──────────────────────────────────────────────────────────────────────────
+
     def connect(self) -> bool:
-        """Connect to IBKR TWS/Gateway."""
-        try:
-            self.ib.connect(self.host, self.port, clientId=self.client_id)
+        """Connect to IBKR TWS/Gateway and verify the API handshake completed."""
+        import socket as _socket
+
+        local_aliases = ["127.0.0.1", "localhost", "::1"]
+        if self.host in local_aliases:
+            hosts_to_try = [self.host] + [h for h in local_aliases if h != self.host]
+        else:
+            hosts_to_try = [self.host]
+
+        attempt_errors = []
+        for idx, host in enumerate(hosts_to_try, start=1):
+            logger.info(
+                f"[IBKR connect attempt {idx}/{len(hosts_to_try)}] "
+                f"Checking TCP reachability of {host}:{self.port} "
+                f"(clientId={self.client_id}, timeout={CONNECT_TIMEOUT_SECONDS}s) …"
+            )
+            try:
+                with _socket.create_connection((host, self.port), timeout=5):
+                    logger.info(
+                        f"[IBKR connect attempt {idx}/{len(hosts_to_try)}] "
+                        f"TCP port {self.port} is open on host={host} — "
+                        "proceeding with ib_insync connect"
+                    )
+            except OSError as sock_err:
+                err = f"TCP check failed for host={host}: {sock_err}"
+                logger.warning(err)
+                attempt_errors.append(err)
+                continue
+
+            # If this times out with TimeoutError it usually means TWS did not
+            # complete the API handshake (hidden approval popup, blocked API thread,
+            # or localhost trust mismatch between IPv4/IPv6).
+            try:
+                self.ib.connect(
+                    host,
+                    self.port,
+                    clientId=self.client_id,
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                    readonly=False,
+                )
+            except Exception as e:
+                err_msg = str(e) or type(e).__name__
+                err = f"ib_insync connect failed for host={host}:{self.port} — {err_msg}"
+                logger.warning(err)
+                attempt_errors.append(err)
+                try:
+                    self.ib.disconnect()
+                except Exception:
+                    pass
+                continue
+
+            # Verify the handshake fully completed and account list is available.
+            if not self.ib.isConnected():
+                err = (
+                    f"Connect returned but session not active for host={host}. "
+                    "TWS may have closed the session (for example duplicate clientId)."
+                )
+                logger.warning(err)
+                attempt_errors.append(err)
+                try:
+                    self.ib.disconnect()
+                except Exception:
+                    pass
+                continue
+
+            accounts = self.ib.managedAccounts()
+            if not accounts:
+                logger.warning(
+                    f"Connected on host={host} but no managed accounts returned. "
+                    "Proceeding anyway — verify account permissions if orders fail."
+                )
+            else:
+                logger.info(f"Connected to IBKR via host={host} — accounts: {accounts}")
+
+            self.host = host
             self.connected = True
-            logger.info(f"Connected to IBKR at {self.host}:{self.port}")
             return True
-        except Exception as e:
-            logger.error(f"Failed to connect to IBKR: {e}")
-            self.connected = False
-            return False
+
+        logger.error(
+            "All IBKR API connect attempts failed.\n"
+            f"Tried hosts: {', '.join(hosts_to_try)} on port {self.port}, "
+            f"clientId={self.client_id}.\n"
+            f"Attempt details:\n- " + "\n- ".join(attempt_errors) + "\n\n"
+            "══ HOW TO FIX THIS IN TWS ══════════════════════════════════\n"
+            "  TWS → Configure (gear icon top-right) → API → Settings:\n"
+            "  1. Check  ✓  'Enable ActiveX and Socket Clients'\n"
+            "  2. Check  ✓  'Allow connections from localhost only' "
+            "(if your app runs on this machine)\n"
+            "  3. Under 'Trusted IP Addresses', add BOTH: 127.0.0.1 and ::1\n"
+            "  4. Uncheck  ✗  'Read-Only API'  (required to place orders)\n"
+            "  5. Temporarily check ✓ 'Create API message log file' for debugging\n"
+            "  6. Click Apply/OK and FULLY RESTART TWS.\n"
+            "═══════════════════════════════════════════════════════════\n"
+            "  If a 'Do you want to allow API connections?' dialog appears in TWS,\n"
+            "  click YES while this script runs."
+        )
+        self.connected = False
+        return False
 
     def disconnect(self):
         """Disconnect from IBKR."""
@@ -117,6 +237,67 @@ class IBKROptionsExecutor:
                 logger.info("Disconnected from IBKR")
             except Exception as e:
                 logger.error(f"Error disconnecting: {e}")
+
+    def cancel_open_orders_for_option(self, symbol: str, exp_date: str) -> int:
+        """
+        Cancel any open orders for options on this symbol and expiry.
+        Prevents 'Cannot have open orders on both sides of the same US Option contract'.
+        Returns number of orders cancelled.
+        """
+        if not self.connected:
+            return 0
+        exp_ibkr = exp_date.replace("-", "") if "-" in exp_date else exp_date
+        cancelled = 0
+        try:
+            for trade in self.ib.openOrders():
+                c = trade.contract
+                if getattr(c, "secType", "") != "OPT":
+                    continue
+                if getattr(c, "symbol", "") != symbol:
+                    continue
+                c_exp = getattr(c, "lastTradeDateOrContractMonth", "") or ""
+                if c_exp != exp_ibkr:
+                    continue
+                try:
+                    self.ib.cancelOrder(trade.order)
+                    cancelled += 1
+                    logger.info(
+                        f"Cancelled conflicting order: {symbol} {c_exp} "
+                        f"orderId={trade.order.orderId} {trade.order.action}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not cancel order {trade.order.orderId}: {e}")
+            if cancelled:
+                self.ib.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Error cancelling open orders for {symbol} {exp_date}: {e}")
+        return cancelled
+
+    def _wait_for_entry_fill(
+        self,
+        entry_trade,  # ib_insync Trade
+        symbol: str,
+        timeout_seconds: int = 120,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """
+        Wait for the entry (SELL) order to fill before we place SL/TP.
+        Placing BUY (SL/TP) while SELL (entry) is still open causes IBKR to reject
+        with "Cannot have open orders on both sides of the same US Option contract".
+        Returns True if Filled or PartiallyFilled, False on timeout or Cancelled/Invalid.
+        """
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            status = entry_trade.orderStatus.status
+            if status in ("Filled", "PartiallyFilled"):
+                logger.info(f"[LIVE] Entry for {symbol} filled — status: {status}")
+                return True
+            if status in ("Cancelled", "ApiCancelled", "Invalid", "Rejected"):
+                logger.warning(f"[LIVE] Entry for {symbol} ended without fill — status: {status}")
+                return False
+            self.ib.sleep(poll_interval)
+        logger.warning(f"[LIVE] Entry for {symbol} wait timed out after {timeout_seconds}s — status: {entry_trade.orderStatus.status}")
+        return False
 
     def get_option_contract(
         self, symbol: str, strike: float, exp_date: str, right: str, exchange: str = "SMART"
@@ -339,6 +520,11 @@ class IBKROptionsExecutor:
             if dry_run:
                 return None, None, None
 
+            # Cancel any open orders on the same option (avoids "both sides" rejection)
+            n = self.cancel_open_orders_for_option(symbol, exp_date)
+            if n > 0:
+                logger.info(f"[LIVE] Cancelled {n} conflicting order(s) for {symbol} {exp_date}")
+
             # Create entry order (limit order to open iron condor)
             entry_order = LimitOrder("SELL", contracts, entry_limit_price)
             entry_order.tif = "DAY"  # Day order
@@ -347,18 +533,18 @@ class IBKROptionsExecutor:
             # Place entry order
             entry_trade = self.ib.placeOrder(combo, entry_order)
             logger.info(f"[LIVE] Entry order placed — orderId: {entry_trade.order.orderId}  status: {entry_trade.orderStatus.status}")
-            
-            # Wait for order to fill before placing SL/TP
-            # Note: In production, you should wait for actual fill confirmation using trade.filledEvent
-            # For now, we wait a short time and assume the order will fill
-            # In a production system, you'd want to monitor the trade status properly
-            logger.info("Waiting for entry order to fill...")
-            self.ib.sleep(3)
-            
-            # Check if entry order filled (simplified check)
-            if entry_trade.orderStatus.status not in ["Filled", "PartiallyFilled"]:
-                logger.warning(f"Entry order status: {entry_trade.orderStatus.status}. SL/TP orders will be placed anyway.")
-            
+
+            # Wait for entry to FILL before placing SL/TP. IBKR does not allow open orders on both
+            # sides of the same option (SELL entry + BUY SL/TP). Placing SL/TP before entry fills
+            # causes "Cannot have open orders on both sides of the same US Option contract".
+            entry_filled = self._wait_for_entry_fill(entry_trade, symbol, timeout_seconds=120)
+            if not entry_filled:
+                logger.warning(
+                    f"[LIVE] Entry for {symbol} did not fill in time (status: {entry_trade.orderStatus.status}). "
+                    "Skipping SL/TP to avoid both-sides rejection. Add SL/TP manually in TWS after entry fills."
+                )
+                return entry_order, None, None
+
             # Create stop loss order (buy to close when loss threshold is hit)
             # Stop loss: Buy back the iron condor at stop_loss_price (debit)
             stop_loss_order = LimitOrder("BUY", contracts, abs(stop_loss_price))
@@ -452,6 +638,12 @@ class IBKROptionsExecutor:
                     dry_run=dry_run,
                 )
                 
+                # Success only when entry filled and SL/TP were placed (otherwise IBKR rejects with "both sides")
+                full_success = (
+                    entry_order is not None
+                    and sl_order is not None
+                    and tp_order is not None
+                )
                 result = {
                     "index": idx,
                     "symbol": symbol,
@@ -459,7 +651,7 @@ class IBKROptionsExecutor:
                     "entry_order": entry_order.orderId if entry_order and hasattr(entry_order, 'orderId') else None,
                     "stop_loss_order": sl_order.orderId if sl_order and hasattr(sl_order, 'orderId') else None,
                     "take_profit_order": tp_order.orderId if tp_order and hasattr(tp_order, 'orderId') else None,
-                    "success": entry_order is not None,
+                    "success": full_success,
                 }
                 results.append(result)
                 
@@ -615,10 +807,43 @@ Examples:
         action="store_true",
         help="Dry run mode - don't actually place orders",
     )
-    
+    parser.add_argument(
+        "--tickers",
+        nargs="+",
+        default=None,
+        metavar="TICKER",
+        help="Only execute recommendations for these tickers (e.g. --tickers AMZN AAPL). "
+             "If omitted, all tickers in the recommendation file are executed.",
+    )
+    parser.add_argument(
+        "--test-connection",
+        action="store_true",
+        help="Connect to IBKR, print accounts, then exit immediately. "
+             "No recommendations are loaded or orders placed. "
+             "Use to verify the IBKR connection is working before executing trades.",
+    )
+
     args = parser.parse_args()
-    
+
     try:
+        logger.info(
+            f"exeopt starting — host={args.host} port={args.port} "
+            f"client_id={args.client_id} dry_run={args.dry_run} "
+            f"sl={args.stop_loss_pct*100:.0f}% tp={args.take_profit_pct*100:.0f}%"
+            + (" [TEST-CONNECTION]" if args.test_connection else "")
+            + (f" tickers={args.tickers}" if args.tickers else "")
+        )
+
+        # ── Test-connection mode: connect, verify, disconnect, exit ──────────
+        if args.test_connection:
+            executor = IBKROptionsExecutor(host=args.host, port=args.port, client_id=args.client_id)
+            if not executor.connect():
+                logger.error("IBKR connection test FAILED.")
+                sys.exit(1)
+            logger.info("IBKR connection test PASSED.")
+            executor.disconnect()
+            sys.exit(0)
+
         # Auto-detect file if not provided
         if args.file is None:
             logger.info("No file specified. Auto-detecting today's recommendation file...")
@@ -635,17 +860,32 @@ Examples:
         logger.info(f"Loading recommendations from: {args.file}")
         df = load_recommendations(args.file)
         logger.info(f"Loaded {len(df)} recommendations")
+
+        # Filter by tickers if --tickers was supplied
+        if args.tickers:
+            requested = [t.upper() for t in args.tickers]
+            df = df[df["ticker"].str.upper().isin(requested)].reset_index(drop=True)
+            logger.info(
+                f"Filtered to {len(df)} recommendation(s) for ticker(s): {', '.join(requested)}"
+            )
+            if df.empty:
+                logger.error(
+                    f"No recommendations found for ticker(s): {', '.join(requested)}. "
+                    "Check the recommendation file or the date."
+                )
+                sys.exit(1)
         
         # Create executor
         executor = IBKROptionsExecutor(host=args.host, port=args.port, client_id=args.client_id)
         
-        # Connect to IBKR
-        if not args.dry_run:
-            if not executor.connect():
-                logger.error("Failed to connect to IBKR. Exiting.")
-                sys.exit(1)
-        else:
-            logger.info("[DRY RUN MODE] Skipping IBKR connection")
+        # Connect to IBKR.
+        # Dry-run ALSO connects so that the connection can be verified before
+        # market open — only order placement is skipped, not the handshake.
+        if not executor.connect():
+            logger.error("Failed to connect to IBKR. Exiting.")
+            sys.exit(1)
+        if args.dry_run:
+            logger.info("[DRY RUN MODE] Connected successfully — orders will be simulated, not placed.")
         
         try:
             # Execute recommendations
@@ -666,8 +906,7 @@ Examples:
             logger.info(f"Failed: {failed}")
             
         finally:
-            if not args.dry_run:
-                executor.disconnect()
+            executor.disconnect()
 
         if successful == 0 and len(results) > 0:
             logger.error(f"All {len(results)} order(s) failed. Exiting with error.")

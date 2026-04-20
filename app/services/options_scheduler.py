@@ -3,11 +3,12 @@ options_scheduler.py
 --------------------
 APScheduler-based scheduler for the Iron Condor options system.
 
-Schedule (all times US Eastern):
+Schedule (all times US Eastern) — DISABLED when SCHEDULER_ENABLED is False:
   - Every Monday at 09:30  → fetch_sp500_symbols (symbol list update)
   - Every weekday at 17:00 → prefetch_options_datasp (1h after market close at 16:00)
 
 Usage: call start_options_scheduler() once at app startup.
+Set SCHEDULER_ENABLED = True to re-enable automatic jobs; otherwise only manual "Sync Data" runs.
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ from apscheduler.triggers.cron import CronTrigger
 from app.services.options_service import run_fetch_sp500, run_optsp, run_prefetch
 
 logger = logging.getLogger(__name__)
+
+# Disable all automatic/scheduled jobs; system runs only when user manually clicks "Sync Data".
+SCHEDULER_ENABLED = False
+
+print("DEBUG: SCHEDULER STATUS IS: " + ("ENABLED" if SCHEDULER_ENABLED else "DISABLED"))
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -45,10 +51,10 @@ def _job_monday_open() -> None:
 
 
 def _job_daily_prefetch() -> None:
-    """Weekday 16:30 ET: update options data cache for current year."""
+    """Weekday 16:30 ET: update ThetaData options cache for current year."""
     current_year = date.today().year
-    logger.info(f"[options-scheduler] Daily prefetch for year {current_year}...")
-    result = run_prefetch(years=[current_year], workers=4)
+    logger.info(f"[options-scheduler] Daily ThetaData prefetch for year {current_year}...")
+    result = run_prefetch(years=[current_year])
     if result["ok"]:
         logger.info("[options-scheduler] Prefetch completed successfully.")
     else:
@@ -60,8 +66,14 @@ def _job_daily_prefetch() -> None:
 # ---------------------------------------------------------------------------
 
 def start_options_scheduler() -> None:
-    """Start the background scheduler. Safe to call multiple times (idempotent)."""
+    """Start the background scheduler. Safe to call multiple times (idempotent).
+    No jobs are added when SCHEDULER_ENABLED is False (manual Sync Data only).
+    """
     global _scheduler
+
+    if not SCHEDULER_ENABLED:
+        logger.info("[options-scheduler] Disabled (SCHEDULER_ENABLED=False). Only manual Sync Data will run.")
+        return
 
     if _scheduler is not None and _scheduler.running:
         logger.info("[options-scheduler] Already running, skipping start.")

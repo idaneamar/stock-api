@@ -743,13 +743,31 @@ def pick_iron_condors(
                     continue
                 lc = lc_rows.iloc[0]
 
+                # Mid estimate
                 credit = float(sp["_mid"]) - float(lp["_mid"]) + float(sc["_mid"]) - float(lc["_mid"])
-                if credit < float(min_credit):
+
+                # Per-leg bid/ask for conservative fill estimate
+                sp_bid = float(pd.to_numeric(sp[c_bid], errors="coerce"))
+                sp_ask = float(pd.to_numeric(sp[c_ask], errors="coerce"))
+                lp_bid = float(pd.to_numeric(lp[c_bid], errors="coerce"))
+                lp_ask = float(pd.to_numeric(lp[c_ask], errors="coerce"))
+                sc_bid = float(pd.to_numeric(sc[c_bid], errors="coerce"))
+                sc_ask = float(pd.to_numeric(sc[c_ask], errors="coerce"))
+                lc_bid = float(pd.to_numeric(lc[c_bid], errors="coerce"))
+                lc_ask = float(pd.to_numeric(lc[c_ask], errors="coerce"))
+
+                # Conservative fill: sell at bid, buy at ask
+                net_credit_conservative = sp_bid - lp_ask + sc_bid - lc_ask
+
+                # Pro-Fill: aggressive fill weighted 75% mid / 25% conservative
+                pro_fill = (credit * 0.75) + (net_credit_conservative * 0.25)
+
+                if pro_fill < float(min_credit):
                     continue
 
                 # Optional reward/risk sanity filter
                 if float(MIN_CREDIT_TO_WIDTH) > 0 and float(w) > 0:
-                    if (float(credit) / float(w)) < float(MIN_CREDIT_TO_WIDTH):
+                    if (pro_fill / float(w)) < float(MIN_CREDIT_TO_WIDTH):
                         continue
 
                 pop_ln = None
@@ -759,12 +777,11 @@ def pick_iron_condors(
                 if pop < float(min_pop):
                     continue
 
-                max_loss = float(w) - float(credit)  # per share
+                max_loss = float(w) - pro_fill
                 if max_loss <= 0:
                     continue
 
-                                # Score: balance POP and credit, normalized by width (safer default)
-                score = float(pop) * float(credit) / max(float(w), 1e-6)
+                score = float(pop) * pro_fill / max(float(w), 1e-6)
 
                 candidates.append({
                     "ticker": _symbol_base(ticker),
@@ -777,6 +794,9 @@ def pick_iron_condors(
                     "long_call": float(lc[c_strike]),
                     "width": float(w),
                     "net_credit": float(credit),
+                    "net_credit_conservative": float(net_credit_conservative),
+                    "net_credit_opti_fill": float(pro_fill),
+                    "min_recommended_price": float(net_credit_conservative),
                     "max_loss_per_share": float(max_loss),
                     "pop_est": float(pop),
                     "pop_method": "lognormal" if pop_ln is not None else "delta_proxy",
@@ -791,7 +811,7 @@ def pick_iron_condors(
         return pd.DataFrame()
 
     out = pd.DataFrame(candidates)
-    out = out.sort_values(["score", "pop_est", "net_credit"], ascending=[False, False, False]).head(MAX_CANDIDATES_PER_TICKER).reset_index(drop=True)
+    out = out.sort_values(["score", "pop_est", "net_credit_opti_fill"], ascending=[False, False, False]).head(MAX_CANDIDATES_PER_TICKER).reset_index(drop=True)
     return out
 
 

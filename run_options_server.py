@@ -84,13 +84,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.routers.options import router as options_router
+from app.routers.options import ibkr_ping as options_ibkr_ping_handler
+from app.routers import ibkr as ibkr_router
 from app.services.options_scheduler import (
     _job_daily_prefetch,
     _job_monday_open,
     start_options_scheduler,
     stop_options_scheduler,
 )
-from app.services.options_service import warm_ticker_summaries_cache
+from app.services.options_service import warm_ticker_summaries_cache, prewarm_spot_cache, get_recommendations
 
 
 @asynccontextmanager
@@ -113,6 +115,19 @@ async def lifespan(app_instance: FastAPI):
         warm_ticker_summaries_cache(start_year=2023)
     except Exception as exc:
         logger.warning(f"P&L cache warm-up failed: {exc}")
+
+    # Pre-warm EODHD spot-price cache for all current recommendation tickers
+    # so the first browser reprice poll gets instant prices (no EODHD wait).
+    def _prewarm():
+        try:
+            recs = get_recommendations()
+            tickers = [r.get("ticker") for r in recs if r.get("ticker")]
+            if tickers:
+                prewarm_spot_cache(tickers)
+        except Exception as exc:
+            logger.warning(f"Spot cache pre-warm failed: {exc}")
+
+    threading.Thread(target=_prewarm, daemon=True, name="spot-prewarm").start()
 
     # --run-now: catch up on missed scheduled jobs
     if args.run_now:
@@ -156,15 +171,43 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# CORS: allow deployed Flutter app and local dev (localhost with any port)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://stockapp-gpt.web.app"],
+    allow_origin_regex=r"http://(127\.0\.0\.1|localhost)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def allow_private_network_preflight(request, call_next):
+    """
+    Chrome PNA support for https-origin -> http://127.0.0.1 requests.
+    When the browser sends Access-Control-Request-Private-Network: true
+    on preflight, include Access-Control-Allow-Private-Network: true.
+    """
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
 app.include_router(options_router)
+# Match main.py: IBKR routes live under /options/ibkr/... (router has prefix /ibkr).
+# Without this prefix, Flutter paths like /options/ibkr/portfolio-enriched 404.
+app.include_router(ibkr_router.router, prefix="/options")
+
+# Same IBKR ping at root so both /options/ibkr-ping and /ibkr-ping work
+# (handles baseUrl with or without /options and older clients)
+app.add_api_route(
+    "/ibkr-ping",
+    options_ibkr_ping_handler,
+    methods=["GET"],
+    tags=["Options"],
+    summary="Test IBKR connection (alias)",
+)
 
 
 @app.get("/health", tags=["Health"])
